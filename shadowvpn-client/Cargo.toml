@@ -1,0 +1,16 @@
+[package]
+name = "shadowvpn-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+shadowvpn-core = { path = "../shadowvpn-core" }
+boringtun = "0.6"
+tun = { version = "0.8", features = ["async"] }
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+anyhow = "1"
+base64 = "0.22"
+reqwest = { version = "0.12", features = ["json"] }
+serde_json = "1"
+futures = "0.3"

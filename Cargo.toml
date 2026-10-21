@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "shadowvpn-core",
+    "shadowvpn-server",
+    "shadowvpn-client",
+]
+resolver = "2"
