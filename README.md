@@ -44,6 +44,19 @@ Para abrir a GUI:
 cargo run -p shadowvpn-gui
 ```
 
+## Executáveis para download
+
+Cada tag `v*` dispara o workflow de release e publica pacotes prontos na página de Releases:
+
+| Sistema | Pacote | Executáveis |
+|---|---|---|
+| Linux x86_64 | `ShadowVPN-vX.Y.Z-linux-x86_64.tar.gz` | `shadowvpn-client`, `shadowvpn-server`, `shadowvpn-gui` |
+| Windows x86_64 | `ShadowVPN-vX.Y.Z-windows-x86_64.zip` | `shadowvpn-client.exe`, `shadowvpn-server.exe`, `shadowvpn-gui.exe` |
+| macOS Intel | `ShadowVPN-vX.Y.Z-macos-x86_64.tar.gz` | `shadowvpn-client`, `shadowvpn-server`, `shadowvpn-gui` |
+| macOS Apple Silicon | `ShadowVPN-vX.Y.Z-macos-aarch64.tar.gz` | `shadowvpn-client`, `shadowvpn-server`, `shadowvpn-gui` |
+
+No Windows, extraia o ZIP e execute `shadowvpn-server.exe` ou `shadowvpn-gui.exe`. No Linux e macOS, extraia o pacote e, se necessário, aplique `chmod +x` aos três arquivos. A release também inclui o README dentro de cada pacote.
+
 Na GUI, informe o servidor, grupo, senha com ao menos 8 caracteres e endpoint. O botão **Conectar** registra o peer no coordenador e mostra os peers retornados. A GUI é uma camada de controle/monitoramento; o túnel TUN continua sendo iniciado pelo cliente CLI, que evita elevar privilégios diretamente a partir da aplicação gráfica.
 
 ## Testes e build

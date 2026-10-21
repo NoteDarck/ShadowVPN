@@ -1,0 +1,83 @@
+name: Release multiplataforma
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-24.04
+            suffix: ''
+            archive: tar.gz
+          - name: windows-x86_64
+            os: windows-2025
+            suffix: .exe
+            archive: zip
+          - name: macos-x86_64
+            os: macos-13
+            suffix: ''
+            archive: tar.gz
+          - name: macos-aarch64
+            os: macos-14
+            suffix: ''
+            archive: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release binaries
+        run: cargo build --release --workspace
+      - name: Package Unix executables
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="ShadowVPN-${GITHUB_REF_NAME}-${{ matrix.name }}"
+          mkdir "$dir"
+          cp target/release/shadowvpn-client "$dir/"
+          cp target/release/shadowvpn-server "$dir/"
+          cp target/release/shadowvpn-gui "$dir/"
+          cp README.md "$dir/"
+          tar -czf "$dir.tar.gz" "$dir"
+      - name: Package Windows executables
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = "ShadowVPN-$env:GITHUB_REF_NAME-${{ matrix.name }}"
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          Copy-Item target/release/shadowvpn-client.exe $dir
+          Copy-Item target/release/shadowvpn-server.exe $dir
+          Copy-Item target/release/shadowvpn-gui.exe $dir
+          Copy-Item README.md $dir
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ShadowVPN-${{ matrix.name }}
+          path: ShadowVPN-${{ github.ref_name }}-${{ matrix.name }}.*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: ShadowVPN-*
+          merge-multiple: true
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/*
