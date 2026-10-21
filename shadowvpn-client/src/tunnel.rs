@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
-use bytes::BytesMut;
 use futures::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use tokio::net::UdpSocket;
@@ -28,8 +27,7 @@ pub async fn run_tunnel(
         cfg.ensure_root_privileges(true);
     });
 
-    let mut dev = tun::create_as_async(&config)
-        .context("Falha ao criar TUN (execute como root)")?;
+    let dev = tun::create_as_async(&config).context("Falha ao criar TUN (execute como root)")?;
     let mut framed = dev.into_framed();
 
     // 2. Socket UDP para WireGuard
@@ -42,22 +40,14 @@ pub async fn run_tunnel(
     }
 
     let (peer_public, peer_addr) = &peers[0];
-    let mut tunn = Tunn::new(
-        private_key,
-        *peer_public,
-        None,
-        None,
-        0,
-        None,
-    ).map_err(|e| anyhow::anyhow!("Túnel: {:?}", e))?;
+    let mut tunn = Tunn::new(private_key, *peer_public, None, None, 0, None)
+        .map_err(|e| anyhow::anyhow!("Túnel: {:?}", e))?;
 
     let mut udp_buf = [0u8; 65535];
     let mut wg_buf = [0u8; 65535];
-    let mut out_buf = [0u8; 65535];
 
     // Handshake inicial
-    if let TunnResult::WriteToNetwork(packet) =
-        tunn.format_handshake_initiation(&mut wg_buf, false)
+    if let TunnResult::WriteToNetwork(packet) = tunn.format_handshake_initiation(&mut wg_buf, false)
     {
         udp.send_to(packet, peer_addr).await?;
     }
@@ -78,8 +68,8 @@ pub async fn run_tunnel(
                     TunnResult::WriteToNetwork(response) => {
                         udp.send_to(response, peer_addr).await?;
                     }
-                    TunnResult::WriteToTunnel(packet) => {
-                        framed.send(BytesMut::from(packet)).await?;
+                    TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
+                        framed.send(packet.to_vec()).await?;
                     }
                     _ => {}
                 }

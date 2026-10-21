@@ -19,11 +19,13 @@ pub async fn register(
         })
         .send()
         .await?
+        .error_for_status()?
         .json::<RegisterResponse>()
         .await?;
     Ok(resp)
 }
 
+#[allow(dead_code)]
 pub async fn fetch_peers(
     server_url: &str,
     group_name: &str,
@@ -38,6 +40,7 @@ pub async fn fetch_peers(
         })
         .send()
         .await?
+        .error_for_status()?
         .json::<Vec<PeerInfo>>()
         .await?;
     Ok(resp)

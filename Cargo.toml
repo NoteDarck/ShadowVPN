@@ -3,5 +3,6 @@ members = [
     "shadowvpn-core",
     "shadowvpn-server",
     "shadowvpn-client",
+    "shadowvpn-gui",
 ]
 resolver = "2"
