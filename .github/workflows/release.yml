@@ -127,8 +127,9 @@ jobs:
             throw "Checksum do wintun.zip inválido: $actual"
           }
 
-          $wintun = Join-Path $env:RUNNER_TEMP 'wintun'
-          Expand-Archive -Path $zip -DestinationPath $wintun -Force
+          $extract = Join-Path $env:RUNNER_TEMP 'wintun-extract'
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
+          $wintun = Join-Path $extract 'wintun'
           Copy-Item (Join-Path $wintun 'bin/amd64/wintun.dll') $dir
           Copy-Item (Join-Path $wintun 'LICENSE.txt') (Join-Path $dir 'wintun-LICENSE.txt')
 
