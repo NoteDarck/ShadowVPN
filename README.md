@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/icon.png" alt="Ícone do ShadowVPN" width="180">
+</p>
+
 # ShadowVPN
 
 ShadowVPN é uma VPN de grupo inspirada no Radmin VPN, escrita em Rust. Cada computador recebe um IP virtual e pode acessar os outros membros do mesmo grupo. O tráfego entre os computadores é cifrado com WireGuard (BoringTun), e um servidor de relay encaminha os datagramas para que a VPN funcione atrás de NAT, sem abrir portas em cada cliente.
@@ -10,7 +14,7 @@ ShadowVPN é uma VPN de grupo inspirada no Radmin VPN, escrita em Rust. Cada com
 - IP virtual estável por identidade enquanto a sessão estiver ativa.
 - Criptografia ponta a ponta WireGuard entre os peers.
 - Relay UDP no servidor, sem necessidade de port forwarding nos clientes.
-- Cliente CLI e GUI desktop (egui/eframe).
+- Cliente CLI e GUI desktop (egui/eframe), com ícone e identidade visual próprios.
 - Windows, Linux (x86_64 e aarch64) e macOS (Intel e Apple Silicon).
 - Identidade WireGuard persistente e reutilizada entre conexões.
 - Heartbeat, expiração de sessões e limpeza automática de peers inativos.
@@ -212,7 +216,7 @@ sudo ./shadowvpn-client
 Se o arquivo foi baixado pelo navegador e o Gatekeeper bloquear:
 
 ```bash
-xattr -dr com.apple.quarantine ShadowVPN-v0.2.0-macos-aarch64
+xattr -dr com.apple.quarantine ShadowVPN-v0.2.1-macos-aarch64
 ```
 
 Os binários não são assinados nem notarizados.
@@ -236,8 +240,8 @@ Os binários Linux x86_64 são compilados no Ubuntu 22.04 (glibc 2.35) e os de a
 Para criar uma release:
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.2.1
+git push origin v0.2.1
 ```
 
 Também é possível executar o workflow manualmente em **Actions → Release multiplataforma → Run workflow**, informando uma tag que já exista no remoto.
@@ -305,6 +309,7 @@ shadowvpn-core/    DTOs, protocolo do relay, constantes e validações
 shadowvpn-server/  API HTTP, grupos, sessões e relay UDP
 shadowvpn-client/  API, identidade, TUN, WireGuard e motor do cliente
 shadowvpn-gui/     Interface desktop egui/eframe
+assets/            Ícone e identidade visual do ShadowVPN
 .github/           CI e release multiplataforma
 ```
 

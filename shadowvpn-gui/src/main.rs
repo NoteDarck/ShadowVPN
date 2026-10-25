@@ -7,10 +7,15 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 fn main() -> eframe::Result<()> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([760.0, 620.0])
+        .with_min_inner_size([620.0, 480.0]);
+    if let Some(icon) = load_window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([760.0, 620.0])
-            .with_min_inner_size([620.0, 480.0]),
+        viewport,
         ..Default::default()
     };
 
@@ -27,6 +32,7 @@ struct ShadowVpnApp {
     password: String,
     identity_path: String,
     show_password: bool,
+    logo: Option<egui::TextureHandle>,
     status: String,
     notice: Option<String>,
     error: Option<String>,
@@ -49,6 +55,7 @@ impl Default for ShadowVpnApp {
             password: String::new(),
             identity_path: String::new(),
             show_password: false,
+            logo: None,
             status: "Pronto para conectar".into(),
             notice: None,
             error: None,
@@ -68,11 +75,22 @@ impl Default for ShadowVpnApp {
 impl eframe::App for ShadowVpnApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_events();
+        self.ensure_logo(ctx);
         ctx.request_repaint_after(Duration::from_millis(250));
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("ShadowVPN");
-            ui.label("Rede privada com WireGuard e relay próprio.");
+            ui.horizontal(|ui| {
+                if let Some(logo) = &self.logo {
+                    ui.add(egui::Image::from_texture(egui::load::SizedTexture::new(
+                        logo.id(),
+                        egui::vec2(72.0, 72.0),
+                    )));
+                }
+                ui.vertical(|ui| {
+                    ui.heading("ShadowVPN");
+                    ui.label("Rede privada com WireGuard e relay próprio.");
+                });
+            });
             ui.separator();
 
             let busy = self.handle.is_some();
@@ -250,6 +268,23 @@ impl eframe::App for ShadowVpnApp {
 }
 
 impl ShadowVpnApp {
+    fn ensure_logo(&mut self, ctx: &egui::Context) {
+        if self.logo.is_some() {
+            return;
+        }
+
+        let Ok(image) = image::load_from_memory(include_bytes!("../../assets/icon.png")) else {
+            return;
+        };
+        let image = image.into_rgba8();
+        let (width, height) = image.dimensions();
+        let color = egui::ColorImage::from_rgba_unmultiplied(
+            [width as usize, height as usize],
+            image.as_raw(),
+        );
+        self.logo = Some(ctx.load_texture("shadowvpn-logo", color, egui::TextureOptions::LINEAR));
+    }
+
     fn connect(&mut self) {
         self.error = None;
         self.notice = None;
@@ -372,10 +407,34 @@ impl ShadowVpnApp {
     }
 }
 
+fn load_window_icon() -> Option<egui::IconData> {
+    let image = image::load_from_memory(include_bytes!("../../assets/icon.png"))
+        .ok()?
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    Some(egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    })
+}
+
 fn short_key(key: &str) -> String {
     if key.len() <= 20 {
         key.to_string()
     } else {
         format!("{}…{}", &key[..10], &key[key.len() - 6..])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn embedded_icon_is_valid() {
+        let image = image::load_from_memory(include_bytes!("../../assets/icon.png"))
+            .expect("ícone PNG válido")
+            .into_rgba8();
+        assert_eq!(image.dimensions(), (512, 512));
+        assert!(image.pixels().any(|pixel| pixel[3] > 0));
     }
 }

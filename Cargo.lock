@@ -3580,7 +3580,7 @@ dependencies = [
 
 [[package]]
 name = "shadowvpn-client"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3602,7 +3602,7 @@ dependencies = [
 
 [[package]]
 name = "shadowvpn-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -3610,16 +3610,17 @@ dependencies = [
 
 [[package]]
 name = "shadowvpn-gui"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "eframe",
+ "image",
  "shadowvpn-client",
  "shadowvpn-core",
 ]
 
 [[package]]
 name = "shadowvpn-server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "argon2",
