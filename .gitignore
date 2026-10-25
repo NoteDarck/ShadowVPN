@@ -1,3 +1,126 @@
+# ==========================================
+# Rust / Cargo
+# ==========================================
 /target/
-*.swp
+**/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo.lock é versionado porque o workspace gera binários.
+
+# ==========================================
+# ShadowVPN — arquivos sensíveis e de runtime
+# ==========================================
+# Chaves WireGuard geradas localmente
+*.key
+*.priv
+*.pub
+identity.key
+keys/
+private_keys/
+wireguard/
+
+# Configurações locais com senhas/segredos
 .env
+.env.*
+!.env.example
+config.local.toml
+config.local.json
+*.local.toml
+*.local.json
+
+# Bancos de dados locais do servidor (SQLite, etc.)
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+# Logs do ShadowVPN
+*.log
+logs/
+
+# ==========================================
+# IDEs e editores
+# ==========================================
+# VS Code
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json.example
+
+# IntelliJ / CLion / RustRover
+.idea/
+*.iml
+
+# Vim / Neovim
+*.swp
+*.swo
+*~
+.netrwhist
+
+# Emacs
+*#
+.#*
+
+# Helix
+.helix/
+
+# Zed
+.zed/
+
+# ==========================================
+# Sistema operacional
+# ==========================================
+# Linux
+.directory
+.Trash-*
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# ==========================================
+# Build / artefatos diversos
+# ==========================================
+# Binários compilados do ShadowVPN ficam em target/.
+
+# Wintun baixada manualmente
+wintun.dll
+wintun-LICENSE.txt
+
+# Pacotes de distribuição
+dist/
+build/
+*.tar.gz
+*.zip
+*.deb
+*.rpm
+*.AppImage
+*.sha256
+
+# Cobertura de testes
+tarpaulin-report.html
+cobertura/
+lcov.info
+*.profraw
+*.profdata
+
+# Profiling
+perf.data
+perf.data.old
+flamegraph.svg
+
+# ==========================================
+# Documentação gerada
+# ==========================================
+/docs/book/
+/site/

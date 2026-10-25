@@ -1,72 +1,311 @@
 # ShadowVPN
 
-ShadowVPN é um protótipo de VPN ponto a ponto baseado em WireGuard/BoringTun, com um servidor de coordenação, cliente CLI e uma GUI desktop em egui.
+ShadowVPN é uma VPN de grupo inspirada no Radmin VPN, escrita em Rust. Cada computador recebe um IP virtual e pode acessar os outros membros do mesmo grupo. O tráfego entre os computadores é cifrado com WireGuard (BoringTun), e um servidor de relay encaminha os datagramas para que a VPN funcione atrás de NAT, sem abrir portas em cada cliente.
 
-## O que foi corrigido
+> Status: MVP funcional, mas **não auditado**. Use em laboratório, escritório ou comunidade de confiança. Leia a seção [Segurança](#segurança) antes de expor o servidor na internet.
 
-- Configuração do cliente por variáveis de ambiente, sem servidor, grupo ou senha hardcoded.
-- Erros HTTP agora retornam falha explícita no cliente.
-- Validação de grupo, senha, chave pública e endpoint.
-- Registros duplicados não criam novos IPs.
-- Alocação de IP protegida pelo lock da entrada do grupo.
-- Servidor configurável via `SHADOWVPN_LISTEN`.
-- GUI desktop para registrar no grupo, exibir status, IP virtual e peers.
+## Recursos
 
-## Executar
+- Rede privada por grupo, com senha compartilhada.
+- IP virtual estável por identidade enquanto a sessão estiver ativa.
+- Criptografia ponta a ponta WireGuard entre os peers.
+- Relay UDP no servidor, sem necessidade de port forwarding nos clientes.
+- Cliente CLI e GUI desktop (egui/eframe).
+- Windows, Linux (x86_64 e aarch64) e macOS (Intel e Apple Silicon).
+- Identidade WireGuard persistente e reutilizada entre conexões.
+- Heartbeat, expiração de sessões e limpeza automática de peers inativos.
+- Nomes dos computadores exibidos na GUI.
+- Releases automatizados com checksums e `wintun.dll` no pacote Windows.
 
-Requer Rust 1.80 ou superior. Para iniciar o coordenador:
+## Como funciona
 
-```bash
-cargo run -p shadowvpn-server
+```text
+┌──────────────┐        WireGuard cifrado         ┌──────────────┐
+│  Cliente A   │◄───────────────┐         ┌───────►│  Cliente B   │
+│ TUN 26.26... │                │         │        │ TUN 26.26... │
+└──────┬───────┘                │         │        └──────┬───────┘
+       │                        │         │               │
+       │  HTTP 8080/tcp         ▼         ▼   HTTP 8080/tcp│
+       │              ┌──────────────────────────┐         │
+       └─────────────►│ Servidor de coordenação  │◄────────┘
+                      │ grupos, sessões e IPs    │
+                      └────────────┬─────────────┘
+                                   │
+                      relay UDP 8081 (pacotes WireGuard)
+                                   │
+                      ┌────────────▼─────────────┐
+                      │      Relay UDP           │
+                      │ só encaminha ciphertext  │
+                      └──────────────────────────┘
 ```
 
-O servidor escuta em `0.0.0.0:8080` por padrão. Para alterar:
+1. O cliente gera uma chave WireGuard e faz `POST /register` com grupo, senha, chave pública e hostname.
+2. O servidor valida a senha (hash Argon2), aloca um IP virtual e devolve a lista de peers e o endereço do relay.
+3. O cliente cria a interface TUN e envia um `HELLO` UDP ao relay para registrar seu endereço público.
+4. Cada peer mantém uma sessão WireGuard com os demais. O relay encaminha os datagramas pelo `session_id` de destino.
+5. A cada 20 segundos o cliente reenvia o registro (idempotente) para renovar a sessão e atualizar a lista de peers.
+
+O túnel cobre apenas a rede virtual `26.26.26.0/24`. Ele **não** roteia todo o tráfego da internet por padrão.
+
+## Requisitos
+
+- Servidor: Rust estável recente, Linux/macOS/Windows e portas TCP 8080 e UDP 8081 liberadas.
+- Cliente: Rust estável recente e privilégios para criar a interface TUN.
+- Windows: executar como Administrador e manter `wintun.dll` ao lado do executável.
+- Linux: `/dev/net/tun` disponível e `root`, `CAP_NET_ADMIN` ou `sudo`.
+- macOS: `sudo`, pois a interface `utun` e as rotas exigem privilégios.
+
+## Início rápido
+
+### 1. Servidor
 
 ```bash
-SHADOWVPN_LISTEN=0.0.0.0:9000 cargo run -p shadowvpn-server
+cargo run --release -p shadowvpn-server
 ```
 
-Para usar o cliente CLI, abra outro terminal e configure:
+Por padrão, o servidor escuta em `0.0.0.0:8080` (HTTP) e `0.0.0.0:8081` (UDP relay). Para conferir:
 
 ```bash
-export SHADOWVPN_SERVER=http://127.0.0.1:8080
-export SHADOWVPN_GROUP=minha-rede
-export SHADOWVPN_PASSWORD=uma-senha-segura
-export SHADOWVPN_ENDPOINT=127.0.0.1:51820
-cargo run -p shadowvpn-client
+curl http://127.0.0.1:8080/health
 ```
 
-A criação da interface TUN exige privilégios administrativos e suporte de rede do sistema. O cliente CLI inicia o túnel quando houver pelo menos um peer disponível.
-
-Para abrir a GUI:
+Se o servidor estiver atrás de proxy reverso ou NAT, informe o endereço público do relay:
 
 ```bash
-cargo run -p shadowvpn-gui
+SHADOWVPN_RELAY_ADVERTISE=vpn.exemplo.com:8081 cargo run --release -p shadowvpn-server
 ```
 
-## Executáveis para download
+### 2. Cliente CLI
 
-Cada tag `v*` dispara o workflow de release e publica pacotes prontos na página de Releases:
+Em outro computador, com a mesma versão:
 
-| Sistema | Pacote | Executáveis |
+```bash
+SHADOWVPN_SERVER=http://vpn.exemplo.com:8080 \
+SHADOWVPN_GROUP=minha-rede \
+SHADOWVPN_PASSWORD='uma-senha-forte' \
+cargo run --release -p shadowvpn-client
+```
+
+O cliente imprime o IP virtual e o relay nos logs. Use `SHADOWVPN_LOG=debug` para mais detalhes.
+
+Para parar, pressione `Ctrl+C`. O cliente remove o peer do grupo e encerra a interface.
+
+### 3. GUI
+
+```bash
+cargo run --release -p shadowvpn-gui
+```
+
+Preencha servidor, grupo e senha e clique em **Conectar**. A GUI cria a interface TUN, mostra o IP virtual, o relay, sua chave pública e os peers conectados.
+
+A GUI não eleva privilégios automaticamente. No Windows, abra como Administrador; no Linux/macOS, inicie pelo terminal com as permissões necessárias.
+
+## Configuração
+
+### Cliente
+
+Flags da CLI (as variáveis de ambiente equivalentes estão entre parênteses):
+
+| Flag | Variável | Padrão |
 |---|---|---|
-| Linux x86_64 | `ShadowVPN-vX.Y.Z-linux-x86_64.tar.gz` | `shadowvpn-client`, `shadowvpn-server`, `shadowvpn-gui` |
-| Windows x86_64 | `ShadowVPN-vX.Y.Z-windows-x86_64.zip` | `shadowvpn-client.exe`, `shadowvpn-server.exe`, `shadowvpn-gui.exe` |
-| macOS Intel | `ShadowVPN-vX.Y.Z-macos-x86_64.tar.gz` | `shadowvpn-client`, `shadowvpn-server`, `shadowvpn-gui` |
-| macOS Apple Silicon | `ShadowVPN-vX.Y.Z-macos-aarch64.tar.gz` | `shadowvpn-client`, `shadowvpn-server`, `shadowvpn-gui` |
+| `--server` | `SHADOWVPN_SERVER` | `http://127.0.0.1:8080` |
+| `--group` | `SHADOWVPN_GROUP` | `minha-rede` |
+| `--password` | `SHADOWVPN_PASSWORD` | obrigatória |
+| `--identity` | `SHADOWVPN_IDENTITY` | caminho padrão do sistema |
+| — | `SHADOWVPN_HOSTNAME` | hostname do sistema; exibido aos peers |
 
-No Windows, extraia o ZIP e execute `shadowvpn-server.exe` ou `shadowvpn-gui.exe`. No Linux e macOS, extraia o pacote e, se necessário, aplique `chmod +x` aos três arquivos. A release também inclui o README dentro de cada pacote.
+Prefira `SHADOWVPN_PASSWORD` em vez de `--password`: argumentos de linha de comando podem aparecer no histórico e na lista de processos.
 
-Na GUI, informe o servidor, grupo, senha com ao menos 8 caracteres e endpoint. O botão **Conectar** registra o peer no coordenador e mostra os peers retornados. A GUI é uma camada de controle/monitoramento; o túnel TUN continua sendo iniciado pelo cliente CLI, que evita elevar privilégios diretamente a partir da aplicação gráfica.
+O nome do grupo deve ter até 64 caracteres alfanuméricos, `-` ou `_`. A senha deve ter entre 8 e 128 caracteres.
 
-## Testes e build
+A identidade é criada automaticamente e nunca deve ser copiada entre computadores:
+
+- Linux: `$XDG_CONFIG_HOME/shadowvpn/identity.key` ou `~/.config/shadowvpn/identity.key`
+- macOS: `~/Library/Application Support/shadowvpn/identity.key`
+- Windows: `%APPDATA%\ShadowVPN\identity.key`
+
+O arquivo tem permissão restrita no Unix. Se duas pessoas usarem a mesma identidade ao mesmo tempo, o servidor as tratará como o mesmo peer.
+
+### Servidor
+
+| Variável | Padrão | Descrição |
+|---|---|---|
+| `SHADOWVPN_LISTEN` | `0.0.0.0:8080` | Endereço HTTP da API |
+| `SHADOWVPN_RELAY_LISTEN` | `0.0.0.0:8081` | Endereço UDP do relay |
+| `SHADOWVPN_RELAY_ADVERTISE` | derivado do `Host` | Endereço público do relay devolvido aos clientes |
+| `SHADOWVPN_PEER_TTL` | `75` | Segundos sem heartbeat até remover o peer (mínimo 30) |
+| `SHADOWVPN_LOG` ou `RUST_LOG` | `info` | Filtro de logs, por exemplo `debug` |
+
+Se `SHADOWVPN_RELAY_ADVERTISE` não for definido, o servidor usa o host do cabeçalho HTTP `Host` e a porta UDP efetiva. Em produção atrás de proxy reverso, defina explicitamente o endereço público:
+
+```bash
+SHADOWVPN_RELAY_ADVERTISE=vpn.exemplo.com:8081
+```
+
+Para IPv6, use colchetes: `SHADOWVPN_RELAY_ADVERTISE=[2001:db8::10]:8081`.
+
+### API HTTP
+
+| Método | Rota | Função |
+|---|---|---|
+| `GET` | `/health` | Saúde do servidor |
+| `POST` | `/register` | Entrar no grupo e obter IP, sessão e peers |
+| `POST` | `/peers` | Heartbeat alternativo e lista atualizada de peers |
+| `POST` | `/unregister` | Sair do grupo |
+
+O estado do servidor é mantido em memória. Reiniciar o processo apaga grupos e sessões; os clientes se registram novamente no próximo heartbeat. Se o IP virtual mudar, reconecte o cliente.
+
+## Portas, firewall e HTTPS
+
+- **8080/tcp**: API de coordenação. Pode ficar atrás de um proxy reverso com HTTPS.
+- **8081/udp**: relay. Precisa estar acessível diretamente pelos clientes; não é proxy HTTP.
+- Libere as duas portas no firewall do servidor e no provedor de nuvem.
+
+Exemplo de proxy TLS com Caddy:
+
+```caddyfile
+vpn.exemplo.com {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+Nesse caso, mantenha `SHADOWVPN_LISTEN=127.0.0.1:8080` e configure `SHADOWVPN_RELAY_ADVERTISE=vpn.exemplo.com:8081`. Sem HTTPS, a senha do grupo e as chaves públicas trafegam em texto claro.
+
+## Permissões por sistema
+
+### Linux
+
+Opção recomendada, sem executar como root:
+
+```bash
+sudo setcap cap_net_admin+ep ./target/release/shadowvpn-client
+sudo setcap cap_net_admin+ep ./target/release/shadowvpn-gui
+```
+
+Depois execute normalmente. Se preferir `sudo`:
+
+```bash
+sudo env \
+  SHADOWVPN_SERVER=http://vpn.exemplo.com:8080 \
+  SHADOWVPN_GROUP=minha-rede \
+  SHADOWVPN_PASSWORD='uma-senha-forte' \
+  ./target/release/shadowvpn-client
+```
+
+Use um `SHADOWVPN_IDENTITY` explícito se quiser que a chave criada pelo processo root pertença ao seu usuário.
+
+### Windows
+
+1. Extraia o ZIP.
+2. Mantenha `wintun.dll` e `wintun-LICENSE.txt` na mesma pasta.
+3. Clique com o botão direito em `shadowvpn-gui.exe` e escolha **Executar como administrador**.
+4. Permita a rede no firewall do Windows quando solicitado.
+
+Sem `wintun.dll`, a criação do TUN falha. O binário é x86_64.
+
+### macOS
+
+```bash
+sudo ./shadowvpn-client
+```
+
+Se o arquivo foi baixado pelo navegador e o Gatekeeper bloquear:
+
+```bash
+xattr -dr com.apple.quarantine ShadowVPN-v0.2.0-macos-aarch64
+```
+
+Os binários não são assinados nem notarizados.
+
+## Releases e build
+
+Cada tag `v*` dispara `.github/workflows/release.yml` e publica:
+
+| Sistema | Pacote |
+|---|---|
+| Linux x86_64 | `ShadowVPN-vX.Y.Z-linux-x86_64.tar.gz` |
+| Linux aarch64 | `ShadowVPN-vX.Y.Z-linux-aarch64.tar.gz` |
+| Windows x86_64 | `ShadowVPN-vX.Y.Z-windows-x86_64.zip` |
+| macOS Intel | `ShadowVPN-vX.Y.Z-macos-x86_64.tar.gz` |
+| macOS Apple Silicon | `ShadowVPN-vX.Y.Z-macos-aarch64.tar.gz` |
+
+Todos os pacotes incluem `shadowvpn-client`, `shadowvpn-server` e `shadowvpn-gui`. O pacote Windows inclui `wintun.dll` e a licença da Wintun. O release também publica `SHA256SUMS.txt`.
+
+Os binários Linux x86_64 são compilados no Ubuntu 22.04 (glibc 2.35) e os de aarch64 no Ubuntu 24.04 (glibc 2.39). A GUI Linux também precisa de bibliotecas de sistema para Wayland/X11 e OpenGL.
+
+Para criar uma release:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+Também é possível executar o workflow manualmente em **Actions → Release multiplataforma → Run workflow**, informando uma tag que já exista no remoto.
+
+Build local:
 
 ```bash
 cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo build --release --workspace
 ```
 
-## Limitações conhecidas
+Binários gerados em `target/release/`: `shadowvpn-server`, `shadowvpn-client` e `shadowvpn-gui`.
 
-Este release mantém a arquitetura original de protótipo: estado do coordenador é mantido em memória, o cliente de túnel usa o primeiro peer retornado e não há NAT traversal/STUN. Para uso em produção, adicione persistência, TLS/autenticação de transporte, expiração de peers e gerenciamento de múltiplos túneis.
+## Segurança
+
+- Os pacotes entre peers são cifrados e autenticados pelo WireGuard. O relay encaminha somente ciphertext, mas vê metadados como IPs públicos, sessões e volume de tráfego.
+- A API de coordenação usa HTTP simples. Em qualquer rede não confiável, coloque-a atrás de HTTPS. A senha do grupo é enviada a cada requisição.
+- O servidor armazena apenas o hash Argon2 da senha do grupo. A senha em texto claro existe somente durante a requisição.
+- Os `session_id` são compartilhados com os peers do grupo para permitir o roteamento. Um membro mal-intencionado do grupo pode tentar interferir no relay; o WireGuard ainda impede a leitura ou falsificação dos pacotes, mas indisponibilidade e metadados não são protegidos.
+- Qualquer pessoa que alcance a API pode criar um grupo novo e definir a senha dele. Use nomes de grupo difíceis de adivinhar ou pré-registre os grupos antes de divulgar o servidor.
+- Não há rate limiting nem cotas por IP. Para um servidor público, coloque a API atrás de um proxy com limites de requisição e monitore o consumo de memória/CPU.
+- Não há auditoria de segurança independente, testes de penetração ou garantia de anonimato.
+
+## Limitações
+
+- **Somente relay**: todo o tráfego passa pelo servidor; não há conexão direta P2P/STUN/TURN. A largura de banda do servidor limita a VPN.
+- **IPv4 apenas**: rede virtual `/24`, máximo de 253 peers por grupo.
+- **Sem multicast**: broadcast IPv4 é replicado para os peers, mas multicast não é suportado.
+- **Sem DNS próprio**: acesse os peers pelo IP virtual; os nomes são apenas exibidos na GUI.
+- **Estado em memória**: sem banco de dados; reiniciar o servidor perde grupos e sessões.
+- **Sem NAT traversal para o servidor**: o relay UDP precisa ser alcançável na porta publicada.
+- **Sem instalador, serviço ou inicialização automática**: os binários são portáveis.
+- **Sem assinatura de código**: Windows SmartScreen e macOS Gatekeeper podem avisar.
+- **Sem túnel de internet completa**: apenas a sub-rede virtual é roteada.
+
+## Solução de problemas
+
+**A GUI mostra erro ao conectar e o túnel não sobe**
+- Verifique se está executando como Administrador/root ou se concedeu `CAP_NET_ADMIN`.
+- No Windows, confirme que `wintun.dll` está ao lado do `.exe`.
+
+**Os peers aparecem, mas o ping não funciona**
+- Confirme que os dois estão no mesmo grupo e com a mesma senha.
+- Verifique se a porta UDP do relay está liberada no servidor e no provedor de nuvem.
+- O firewall local pode bloquear ICMP. No Windows, permita ICMPv4 ou teste com uma conexão TCP.
+- O MTU da interface é 1380 para acomodar WireGuard + relay.
+
+**O relay devolvido aponta para 127.0.0.1 ou para o endereço errado**
+- Defina `SHADOWVPN_RELAY_ADVERTISE` com o host/porta públicos.
+- Se estiver atrás de proxy reverso, o cabeçalho `Host` pode não ser o endereço do relay.
+
+**A conexão cai após reiniciar o servidor**
+- O estado é em memória. Aguarde o próximo heartbeat ou reconecte o cliente. Se o IP virtual mudou, a GUI pede reconexão.
+
+**Linux: erro de permissão em `/dev/net/tun`**
+- Confirme que o dispositivo existe: `ls -l /dev/net/tun`.
+- Use `sudo` ou `setcap cap_net_admin+ep` no binário.
+
+## Estrutura
+
+```text
+shadowvpn-core/    DTOs, protocolo do relay, constantes e validações
+shadowvpn-server/  API HTTP, grupos, sessões e relay UDP
+shadowvpn-client/  API, identidade, TUN, WireGuard e motor do cliente
+shadowvpn-gui/     Interface desktop egui/eframe
+.github/           CI e release multiplataforma
+```
+
+ShadowVPN não é afiliado ao Radmin VPN. WireGuard e BoringTun pertencem aos seus respectivos autores. A DLL da Wintun é distribuída sob a licença incluída no pacote Windows.

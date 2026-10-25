@@ -1,17 +1,43 @@
-use base64::{engine::general_purpose::STANDARD, Engine};
-use boringtun::x25519::{PublicKey, StaticSecret};
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use eframe::egui;
-use reqwest::blocking::Client;
-use shadowvpn_core::{PeerInfo, RegisterRequest, RegisterResponse};
+use shadowvpn_client::{ClientConfig, ClientEvent, ClientHandle};
+use shadowvpn_core::PeerInfo;
+use std::path::PathBuf;
+use std::time::Duration;
+
+fn main() -> eframe::Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([760.0, 620.0])
+            .with_min_inner_size([620.0, 480.0]),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "ShadowVPN",
+        options,
+        Box::new(|_cc| Ok(Box::new(ShadowVpnApp::default()))),
+    )
+}
 
 struct ShadowVpnApp {
     server: String,
     group: String,
     password: String,
-    endpoint: String,
+    identity_path: String,
+    show_password: bool,
     status: String,
+    notice: Option<String>,
+    error: Option<String>,
+    hostname: String,
+    public_key: String,
     virtual_ip: String,
+    relay: String,
     peers: Vec<PeerInfo>,
+    handle: Option<ClientHandle>,
+    connecting: bool,
+    stopping: bool,
     connected: bool,
 }
 
@@ -21,10 +47,19 @@ impl Default for ShadowVpnApp {
             server: "http://127.0.0.1:8080".into(),
             group: "minha-rede".into(),
             password: String::new(),
-            endpoint: "127.0.0.1:51820".into(),
+            identity_path: String::new(),
+            show_password: false,
             status: "Pronto para conectar".into(),
-            virtual_ip: "-".into(),
+            notice: None,
+            error: None,
+            hostname: String::new(),
+            public_key: String::new(),
+            virtual_ip: String::new(),
+            relay: String::new(),
             peers: Vec::new(),
+            handle: None,
+            connecting: false,
+            stopping: false,
             connected: false,
         }
     }
@@ -32,72 +67,315 @@ impl Default for ShadowVpnApp {
 
 impl eframe::App for ShadowVpnApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_events();
+        ctx.request_repaint_after(Duration::from_millis(250));
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("ShadowVPN");
-            ui.label("Cliente desktop para sua rede privada WireGuard.");
+            ui.label("Rede privada com WireGuard e relay próprio.");
             ui.separator();
-            egui::Grid::new("settings").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                ui.label("Servidor"); ui.text_edit_singleline(&mut self.server); ui.end_row();
-                ui.label("Grupo"); ui.text_edit_singleline(&mut self.group); ui.end_row();
-                ui.label("Senha"); ui.add(egui::TextEdit::singleline(&mut self.password).password(true)); ui.end_row();
-                ui.label("Endpoint público"); ui.text_edit_singleline(&mut self.endpoint); ui.end_row();
-            });
-            ui.add_space(8.0);
+
+            let busy = self.handle.is_some();
+            egui::Grid::new("config")
+                .num_columns(2)
+                .spacing([14.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("Servidor");
+                    ui.add_enabled(
+                        !busy,
+                        egui::TextEdit::singleline(&mut self.server)
+                            .desired_width(420.0)
+                            .hint_text("http://vpn.exemplo.com:8080"),
+                    );
+                    ui.end_row();
+
+                    ui.label("Grupo");
+                    ui.add_enabled(
+                        !busy,
+                        egui::TextEdit::singleline(&mut self.group)
+                            .desired_width(220.0)
+                            .hint_text("minha-rede"),
+                    );
+                    ui.end_row();
+
+                    ui.label("Senha");
+                    ui.add_enabled(
+                        !busy,
+                        egui::TextEdit::singleline(&mut self.password)
+                            .password(!self.show_password)
+                            .desired_width(220.0),
+                    );
+                    ui.end_row();
+
+                    ui.label("Identidade");
+                    ui.add_enabled(
+                        !busy,
+                        egui::TextEdit::singleline(&mut self.identity_path)
+                            .desired_width(420.0)
+                            .hint_text("opcional: caminho da chave persistente"),
+                    );
+                    ui.end_row();
+                });
+
             ui.horizontal(|ui| {
-                if ui.add_enabled(!self.connected, egui::Button::new("Conectar")).clicked() { self.connect(); }
-                if ui.add_enabled(self.connected, egui::Button::new("Desconectar")).clicked() { self.connected = false; self.status = "Desconectado".into(); }
+                ui.checkbox(&mut self.show_password, "Mostrar senha");
+                if ui
+                    .add_enabled(
+                        !busy,
+                        egui::Button::new(if self.connecting {
+                            "Conectando..."
+                        } else {
+                            "Conectar"
+                        }),
+                    )
+                    .clicked()
+                {
+                    self.connect();
+                }
+
+                if ui
+                    .add_enabled(busy && !self.stopping, egui::Button::new("Desconectar"))
+                    .clicked()
+                {
+                    self.disconnect();
+                }
             });
+
             ui.separator();
-            ui.label(format!("Status: {}", self.status));
-            ui.label(format!("IP virtual: {}", self.virtual_ip));
-            ui.heading("Peers encontrados");
-            if self.peers.is_empty() { ui.label("Nenhum peer no grupo ainda."); }
-            for peer in &self.peers { ui.label(format!("{} — {}", peer.virtual_ip, peer.endpoint)); }
+
+            match &self.error {
+                Some(error) => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 80, 80),
+                        format!("Erro: {error}"),
+                    );
+                }
+                None => {
+                    let color = if self.connected {
+                        egui::Color32::from_rgb(70, 170, 90)
+                    } else {
+                        ui.visuals().text_color()
+                    };
+                    ui.colored_label(color, format!("Status: {}", self.status));
+                }
+            }
+
+            if let Some(notice) = &self.notice {
+                ui.colored_label(egui::Color32::from_rgb(190, 150, 40), notice);
+            }
+
+            if !self.virtual_ip.is_empty() {
+                ui.add_space(6.0);
+                egui::Grid::new("session")
+                    .num_columns(2)
+                    .spacing([14.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("Nome");
+                        ui.monospace(&self.hostname);
+                        ui.end_row();
+
+                        ui.label("IP virtual");
+                        ui.monospace(&self.virtual_ip);
+                        ui.end_row();
+
+                        ui.label("Relay");
+                        ui.monospace(&self.relay);
+                        ui.end_row();
+
+                        ui.label("Chave pública");
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&self.public_key).monospace())
+                                .selectable(true),
+                        );
+                        ui.end_row();
+                    });
+            }
+
+            ui.add_space(10.0);
+            ui.heading("Peers");
+            if !self.connected {
+                ui.label("Conecte-se para listar os outros computadores do grupo.");
+            } else if self.peers.is_empty() {
+                ui.label("Nenhum outro peer conectado. Aguardando...");
+            } else {
+                egui::ScrollArea::vertical()
+                    .max_height(190.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("peers")
+                            .num_columns(4)
+                            .striped(true)
+                            .spacing([18.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.strong("Nome");
+                                ui.strong("IP virtual");
+                                ui.strong("Sessão");
+                                ui.strong("Chave pública");
+                                ui.end_row();
+
+                                for peer in &self.peers {
+                                    let name = if peer.hostname.is_empty() {
+                                        "Peer"
+                                    } else {
+                                        peer.hostname.as_str()
+                                    };
+                                    ui.label(name);
+                                    ui.monospace(&peer.virtual_ip);
+                                    ui.monospace(format!("{:016x}", peer.session_id));
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(short_key(&peer.public_key))
+                                                .monospace(),
+                                        )
+                                        .selectable(true),
+                                    );
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            }
+
             ui.add_space(12.0);
-            ui.small("Nota: a interface TUN exige privilégios de administrador e é iniciada pelo shadowvpn-client.");
+            ui.separator();
+            ui.small(
+                "A GUI cria a interface TUN ao conectar. No Windows, execute como Administrador \
+                 e mantenha wintun.dll ao lado do executável. No Linux/macOS, execute com sudo \
+                 ou conceda CAP_NET_ADMIN.",
+            );
+            ui.small(
+                "O tráfego entre peers é cifrado com WireGuard. O servidor de relay não vê o \
+                 conteúdo dos pacotes.",
+            );
         });
     }
 }
 
 impl ShadowVpnApp {
     fn connect(&mut self) {
-        if self.password.len() < 8 {
-            self.status = "A senha precisa ter pelo menos 8 caracteres".into();
-            return;
-        }
-        let private = StaticSecret::random_from_rng(rand_core::OsRng);
-        let public = PublicKey::from(&private);
-        let body = RegisterRequest {
-            group_name: self.group.clone(),
-            group_password: self.password.clone(),
-            public_key: STANDARD.encode(public.as_bytes()),
-            endpoint: self.endpoint.clone(),
+        self.error = None;
+        self.notice = None;
+        self.connecting = true;
+        self.stopping = false;
+        self.status = "Conectando...".into();
+        self.clear_session();
+
+        let identity_path = {
+            let value = self.identity_path.trim();
+            if value.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(value))
+            }
         };
-        let url = format!("{}/register", self.server.trim_end_matches('/'));
-        match Client::new()
-            .post(url)
-            .json(&body)
-            .send()
-            .and_then(|r| r.error_for_status())
-            .and_then(|r| r.json::<RegisterResponse>())
-        {
-            Ok(response) => {
-                self.virtual_ip = response.virtual_ip;
-                self.peers = response.peers;
-                self.connected = true;
-                self.status = "Registrado no grupo (túnel disponível no cliente CLI)".into();
+
+        let config =
+            ClientConfig::new(self.server.trim(), self.group.trim(), self.password.clone())
+                .with_identity_path(identity_path);
+
+        match ClientHandle::spawn(config) {
+            Ok(handle) => {
+                self.handle = Some(handle);
             }
             Err(error) => {
-                self.status = format!("Falha ao conectar: {error}");
+                self.connecting = false;
+                self.connected = false;
+                self.error = Some(format!("{error:#}"));
+                self.status = "Falha ao conectar".into();
             }
         }
     }
+
+    fn disconnect(&mut self) {
+        if self.stopping {
+            return;
+        }
+        self.stopping = true;
+        self.status = "Desconectando...".into();
+        if let Some(handle) = &mut self.handle {
+            handle.stop();
+        }
+    }
+
+    fn poll_events(&mut self) {
+        let mut events = Vec::new();
+        if let Some(handle) = &self.handle {
+            while let Some(event) = handle.try_recv() {
+                events.push(event);
+            }
+        }
+
+        let mut finished = false;
+        for event in events {
+            match event {
+                ClientEvent::Registered {
+                    hostname,
+                    virtual_ip,
+                    relay,
+                    public_key,
+                    peers,
+                } => {
+                    self.connected = true;
+                    self.connecting = false;
+                    self.stopping = false;
+                    self.error = None;
+                    self.notice = None;
+                    self.hostname = hostname;
+                    self.virtual_ip = virtual_ip;
+                    self.relay = relay;
+                    self.public_key = public_key;
+                    self.peers = peers;
+                    self.status = "Conectado".into();
+                }
+                ClientEvent::Peers(peers) => {
+                    self.peers = peers;
+                    self.notice = None;
+                }
+                ClientEvent::Status(status) => {
+                    if self.connected {
+                        self.notice = Some(status);
+                    } else {
+                        self.status = status;
+                    }
+                }
+                ClientEvent::Error(error) => {
+                    self.connected = false;
+                    self.connecting = false;
+                    self.stopping = false;
+                    self.notice = None;
+                    self.error = Some(error);
+                    self.status = "Erro".into();
+                    self.clear_session();
+                }
+                ClientEvent::Finished => {
+                    finished = true;
+                }
+            }
+        }
+
+        if finished {
+            self.handle = None;
+            self.connected = false;
+            self.connecting = false;
+            self.stopping = false;
+            self.clear_session();
+            if self.error.is_none() {
+                self.status = "Desconectado".into();
+            }
+        }
+    }
+
+    fn clear_session(&mut self) {
+        self.hostname.clear();
+        self.public_key.clear();
+        self.virtual_ip.clear();
+        self.relay.clear();
+        self.peers.clear();
+    }
 }
 
-fn main() -> eframe::Result<()> {
-    eframe::run_native(
-        "ShadowVPN",
-        eframe::NativeOptions::default(),
-        Box::new(|_cc| Ok(Box::new(ShadowVpnApp::default()))),
-    )
+fn short_key(key: &str) -> String {
+    if key.len() <= 20 {
+        key.to_string()
+    } else {
+        format!("{}…{}", &key[..10], &key[key.len() - 6..])
+    }
 }

@@ -1,67 +1,130 @@
-use crate::state::AppState;
-use axum::{extract::State, http::StatusCode, Json};
+use crate::state::{AppState, StateError};
+use axum::{
+    extract::State,
+    http::{header::HOST, HeaderMap, StatusCode},
+    Json,
+};
 use shadowvpn_core::{
-    valid_endpoint, valid_group_name, valid_password, valid_public_key, PeerInfo, PeersRequest,
-    RegisterRequest, RegisterResponse,
+    clean_hostname, valid_group_name, valid_password, valid_public_key, ErrorResponse,
+    PeersRequest, PeersResponse, RegisterRequest, RegisterResponse, UnregisterRequest,
 };
 
-fn bad(message: &str) -> (StatusCode, Json<serde_json::Value>) {
+type ApiError = (StatusCode, Json<ErrorResponse>);
+type ApiResult<T> = Result<Json<T>, ApiError>;
+
+fn api_error(status: StatusCode, message: &str) -> ApiError {
     (
-        StatusCode::BAD_REQUEST,
-        Json(serde_json::json!({ "error": message })),
+        status,
+        Json(ErrorResponse {
+            error: message.to_string(),
+        }),
     )
+}
+
+fn state_error(error: StateError) -> ApiError {
+    match error {
+        StateError::InvalidCredentials => {
+            api_error(StatusCode::UNAUTHORIZED, "senha ou grupo inválidos")
+        }
+        StateError::GroupFull => {
+            api_error(StatusCode::CONFLICT, "o grupo atingiu o limite de peers")
+        }
+        StateError::SessionNotFound => {
+            api_error(StatusCode::NOT_FOUND, "sessão não encontrada ou expirada")
+        }
+        StateError::Internal => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "erro interno ao processar a requisição",
+        ),
+    }
 }
 
 pub async fn register(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<RegisterRequest>,
-) -> Result<Json<RegisterResponse>, (StatusCode, Json<serde_json::Value>)> {
+) -> ApiResult<RegisterResponse> {
     if !valid_group_name(&req.group_name)
         || !valid_password(&req.group_password)
         || !valid_public_key(&req.public_key)
-        || !valid_endpoint(&req.endpoint)
     {
-        return Err(bad("dados de registro inválidos"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "dados de registro inválidos",
+        ));
     }
-    if let Some(stored) = state.group_passwords.get(&req.group_name) {
-        if stored.value() != &req.group_password {
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({ "error": "senha do grupo incorreta" })),
-            ));
-        }
-    } else {
-        state
-            .group_passwords
-            .insert(req.group_name.clone(), req.group_password.clone());
-    }
-    let peer = PeerInfo {
-        public_key: req.public_key,
-        endpoint: req.endpoint,
-        virtual_ip: String::new(),
-    };
-    let (virtual_ip, peers) = state.register_peer(&req.group_name, peer);
-    Ok(Json(RegisterResponse { virtual_ip, peers }))
+
+    let hostname = clean_hostname(&req.hostname);
+    let outcome = state
+        .register(
+            &req.group_name,
+            &req.group_password,
+            &req.public_key,
+            &hostname,
+        )
+        .map_err(state_error)?;
+
+    let host = headers.get(HOST).and_then(|value| value.to_str().ok());
+    let relay = state.relay_address(host);
+
+    tracing::info!(
+        group = %req.group_name,
+        virtual_ip = %outcome.virtual_ip,
+        peers = outcome.peers.len(),
+        hostname = %hostname,
+        "peer registrado"
+    );
+
+    Ok(Json(RegisterResponse {
+        virtual_ip: outcome.virtual_ip.to_string(),
+        session_id: outcome.session_id,
+        relay,
+        peers: outcome.peers,
+    }))
 }
 
-pub async fn list_peers(
+pub async fn peers(
     State(state): State<AppState>,
     Json(req): Json<PeersRequest>,
-) -> Result<Json<Vec<PeerInfo>>, (StatusCode, Json<serde_json::Value>)> {
-    if !valid_group_name(&req.group_name) || !valid_password(&req.group_password) {
-        return Err(bad("dados de consulta inválidos"));
+) -> ApiResult<PeersResponse> {
+    if !valid_group_name(&req.group_name)
+        || !valid_password(&req.group_password)
+        || req.session_id == 0
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "dados de consulta inválidos",
+        ));
     }
-    match state.group_passwords.get(&req.group_name) {
-        Some(stored) if stored.value() == &req.group_password => {
-            Ok(Json(state.peers(&req.group_name)))
-        }
-        Some(_) => Err((
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({ "error": "senha do grupo incorreta" })),
-        )),
-        None => Err((
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "grupo não encontrado" })),
-        )),
+
+    let peers = state
+        .heartbeat(&req.group_name, &req.group_password, req.session_id)
+        .map_err(state_error)?;
+
+    Ok(Json(PeersResponse { peers }))
+}
+
+pub async fn unregister(
+    State(state): State<AppState>,
+    Json(req): Json<UnregisterRequest>,
+) -> Result<StatusCode, ApiError> {
+    if !valid_group_name(&req.group_name)
+        || !valid_password(&req.group_password)
+        || req.session_id == 0
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "dados de desconexão inválidos",
+        ));
     }
+
+    state
+        .unregister(&req.group_name, &req.group_password, req.session_id)
+        .map_err(state_error)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "status": "ok" }))
 }

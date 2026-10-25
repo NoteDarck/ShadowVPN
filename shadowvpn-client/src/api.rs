@@ -1,47 +1,123 @@
-use anyhow::Result;
-use shadowvpn_core::{PeerInfo, PeersRequest, RegisterRequest, RegisterResponse};
+use anyhow::{bail, Context, Result};
+use reqwest::{Client, StatusCode};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use shadowvpn_core::{
+    PeersRequest, PeersResponse, RegisterRequest, RegisterResponse, UnregisterRequest,
+};
+use std::time::Duration;
 
-pub async fn register(
-    server_url: &str,
-    group_name: &str,
-    group_password: &str,
-    public_key: &str,
-    endpoint: &str,
-) -> Result<RegisterResponse> {
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("{}/register", server_url))
-        .json(&RegisterRequest {
-            group_name: group_name.to_string(),
-            group_password: group_password.to_string(),
-            public_key: public_key.to_string(),
-            endpoint: endpoint.to_string(),
-        })
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<RegisterResponse>()
-        .await?;
-    Ok(resp)
+#[derive(Clone)]
+pub struct Api {
+    client: Client,
+    base: String,
 }
 
-#[allow(dead_code)]
-pub async fn fetch_peers(
-    server_url: &str,
-    group_name: &str,
-    group_password: &str,
-) -> Result<Vec<PeerInfo>> {
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("{}/peers", server_url))
-        .json(&PeersRequest {
-            group_name: group_name.to_string(),
-            group_password: group_password.to_string(),
-        })
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<Vec<PeerInfo>>()
-        .await?;
-    Ok(resp)
+impl Api {
+    pub fn new(server: &str) -> Result<Self> {
+        let base = server.trim().trim_end_matches('/').to_string();
+        let url = reqwest::Url::parse(&base)
+            .with_context(|| format!("URL do servidor inválida: {server}"))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            bail!("o servidor deve usar http:// ou https://");
+        }
+
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(20))
+            .user_agent(concat!("ShadowVPN/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .context("não foi possível criar o cliente HTTP")?;
+
+        Ok(Self { client, base })
+    }
+
+    pub async fn register(
+        &self,
+        group_name: &str,
+        group_password: &str,
+        public_key: &str,
+        hostname: &str,
+    ) -> Result<RegisterResponse> {
+        self.post_json(
+            "/register",
+            &RegisterRequest {
+                group_name: group_name.to_string(),
+                group_password: group_password.to_string(),
+                public_key: public_key.to_string(),
+                hostname: hostname.to_string(),
+            },
+        )
+        .await
+        .context("falha ao registrar no grupo")
+    }
+
+    pub async fn heartbeat(
+        &self,
+        group_name: &str,
+        group_password: &str,
+        session_id: u64,
+    ) -> Result<PeersResponse> {
+        self.post_json(
+            "/peers",
+            &PeersRequest {
+                group_name: group_name.to_string(),
+                group_password: group_password.to_string(),
+                session_id,
+            },
+        )
+        .await
+        .context("falha ao atualizar lista de peers")
+    }
+
+    pub async fn unregister(
+        &self,
+        group_name: &str,
+        group_password: &str,
+        session_id: u64,
+    ) -> Result<()> {
+        let response = self
+            .client
+            .post(format!("{}/unregister", self.base))
+            .json(&UnregisterRequest {
+                group_name: group_name.to_string(),
+                group_password: group_password.to_string(),
+                session_id,
+            })
+            .send()
+            .await
+            .context("falha ao enviar desconexão")?;
+
+        let status = response.status();
+        if !status.is_success() && status != StatusCode::NOT_FOUND {
+            let body = response.text().await.unwrap_or_default();
+            bail!("servidor respondeu {status}: {body}");
+        }
+
+        Ok(())
+    }
+
+    async fn post_json<B, T>(&self, path: &str, body: &B) -> Result<T>
+    where
+        B: Serialize + ?Sized,
+        T: DeserializeOwned,
+    {
+        let response = self
+            .client
+            .post(format!("{}{}", self.base, path))
+            .json(body)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            bail!("servidor respondeu {status}: {body}");
+        }
+
+        response
+            .json::<T>()
+            .await
+            .context("resposta inválida do servidor")
+    }
 }

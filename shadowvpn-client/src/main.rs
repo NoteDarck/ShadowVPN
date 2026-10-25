@@ -1,51 +1,72 @@
-mod api;
-mod tunnel;
-
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use boringtun::x25519::{PublicKey, StaticSecret};
-use std::net::SocketAddr;
+use clap::Parser;
+use shadowvpn_client::{run, ClientConfig};
+use std::path::PathBuf;
+use std::time::Duration;
+use tokio::sync::watch;
+use tracing_subscriber::EnvFilter;
+
+#[derive(Parser)]
+#[command(
+    name = "shadowvpn-client",
+    version,
+    about = "Cliente de rede privada com relay, inspirado no Radmin VPN"
+)]
+struct Args {
+    /// URL do servidor de coordenação.
+    #[arg(
+        long,
+        env = "SHADOWVPN_SERVER",
+        default_value = "http://127.0.0.1:8080"
+    )]
+    server: String,
+
+    /// Nome do grupo/rede.
+    #[arg(long, env = "SHADOWVPN_GROUP", default_value = "minha-rede")]
+    group: String,
+
+    /// Senha do grupo (recomendado usar a variável SHADOWVPN_PASSWORD).
+    #[arg(long, env = "SHADOWVPN_PASSWORD", hide_env_values = true)]
+    password: Option<String>,
+
+    /// Caminho da chave de identidade persistente.
+    #[arg(long, env = "SHADOWVPN_IDENTITY")]
+    identity: Option<PathBuf>,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let server_url = env_or("SHADOWVPN_SERVER", "http://127.0.0.1:8080");
-    let group_name = env_or("SHADOWVPN_GROUP", "meu-grupo");
-    let group_password = std::env::var("SHADOWVPN_PASSWORD")
-        .context("defina SHADOWVPN_PASSWORD (mínimo de 8 caracteres)")?;
-    let endpoint = env_or("SHADOWVPN_ENDPOINT", "127.0.0.1:51820");
+    init_tracing();
+    let args = Args::parse();
+    let password = args
+        .password
+        .context("defina --password ou a variável SHADOWVPN_PASSWORD")?;
 
-    let private = StaticSecret::random_from_rng(rand_core::OsRng);
-    let public_b64 = BASE64.encode(PublicKey::from(&private).as_bytes());
-    let resp = api::register(
-        &server_url,
-        &group_name,
-        &group_password,
-        &public_b64,
-        &endpoint,
-    )
-    .await?;
-    anyhow::ensure!(
-        !resp.virtual_ip.is_empty(),
-        "servidor não atribuiu um IP virtual"
-    );
-    println!("IP virtual atribuído: {}", resp.virtual_ip);
+    let config =
+        ClientConfig::new(args.server, args.group, password).with_identity_path(args.identity);
+    config.validate()?;
 
-    let peers: Vec<(PublicKey, SocketAddr)> = resp
-        .peers
-        .iter()
-        .filter_map(|p| {
-            let key_bytes = BASE64.decode(&p.public_key).ok()?;
-            let key = PublicKey::from(<[u8; 32]>::try_from(key_bytes.as_slice()).ok()?);
-            Some((key, p.endpoint.parse().ok()?))
-        })
-        .collect();
-    if peers.is_empty() {
-        println!("Nenhum peer conectado; aguardando outra conexão.");
-        return Ok(());
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let mut session = Box::pin(run(config, stop_rx, None));
+
+    tokio::select! {
+        result = &mut session => result?,
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("encerrando; removendo peer do grupo...");
+            let _ = stop_tx.send(true);
+            match tokio::time::timeout(Duration::from_secs(10), &mut session).await {
+                Ok(result) => result?,
+                Err(_) => tracing::warn!("o servidor não respondeu ao encerramento"),
+            }
+        }
     }
-    tunnel::run_tunnel(private, &resp.virtual_ip, peers).await
+
+    Ok(())
 }
 
-fn env_or(name: &str, default: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| default.to_string())
+fn init_tracing() {
+    let filter = EnvFilter::try_from_env("SHADOWVPN_LOG")
+        .or_else(|_| EnvFilter::try_from_default_env())
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 }

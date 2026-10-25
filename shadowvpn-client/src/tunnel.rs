@@ -1,79 +1,58 @@
-use anyhow::{Context, Result};
-use boringtun::noise::{Tunn, TunnResult};
-use boringtun::x25519::{PublicKey, StaticSecret};
-use futures::{SinkExt, StreamExt};
-use std::net::SocketAddr;
-use tokio::net::UdpSocket;
-use tun::Configuration;
+use anyhow::Result;
+use std::net::Ipv4Addr;
+use tokio_util::codec::Framed;
 
-/// Inicia o loop do túnel WireGuard.
-/// `peers` contém as chaves públicas e endpoints dos outros computadores.
-pub async fn run_tunnel(
-    private_key: StaticSecret,
-    virtual_ip: &str,
-    peers: Vec<(PublicKey, SocketAddr)>,
-) -> Result<()> {
-    // 1. Cria interface TUN com o IP virtual
-    let mut config = Configuration::default();
-    let ip_parts: Vec<u8> = virtual_ip.split('.').map(|s| s.parse().unwrap()).collect();
+pub type TunFramed = Framed<tun::AsyncDevice, tun::TunPacketCodec>;
+
+pub const TUN_MTU: u16 = 1380;
+
+pub fn create(virtual_ip: Ipv4Addr) -> Result<TunFramed> {
+    let mut config = tun::Configuration::default();
     config
-        .address((ip_parts[0], ip_parts[1], ip_parts[2], ip_parts[3]))
-        .netmask((255, 255, 255, 0))
-        .destination((10, 0, 0, 1))
+        .address(virtual_ip)
+        .netmask(Ipv4Addr::new(255, 255, 255, 0))
+        .mtu(TUN_MTU)
         .up();
 
     #[cfg(target_os = "linux")]
-    config.platform_config(|cfg| {
-        cfg.ensure_root_privileges(true);
-    });
-
-    let dev = tun::create_as_async(&config).context("Falha ao criar TUN (execute como root)")?;
-    let mut framed = dev.into_framed();
-
-    // 2. Socket UDP para WireGuard
-    let udp = UdpSocket::bind("0.0.0.0:0").await?;
-
-    // 3. Cria um túnel para cada peer (na prática, gerenciar múltiplos peers exige
-    //    um mapa de Tunn; simplificamos para o primeiro peer aqui)
-    if peers.is_empty() {
-        anyhow::bail!("Nenhum peer disponível no grupo");
-    }
-
-    let (peer_public, peer_addr) = &peers[0];
-    let mut tunn = Tunn::new(private_key, *peer_public, None, None, 0, None)
-        .map_err(|e| anyhow::anyhow!("Túnel: {:?}", e))?;
-
-    let mut udp_buf = [0u8; 65535];
-    let mut wg_buf = [0u8; 65535];
-
-    // Handshake inicial
-    if let TunnResult::WriteToNetwork(packet) = tunn.format_handshake_initiation(&mut wg_buf, false)
     {
-        udp.send_to(packet, peer_addr).await?;
+        config.tun_name("shadowvpn0");
+        config.platform_config(|platform| {
+            platform.ensure_root_privileges(true);
+        });
     }
 
-    println!("ShadowVPN ativo em {}. Peer: {}", virtual_ip, peer_addr);
-
-    // 4. Loop principal
-    loop {
-        tokio::select! {
-            Some(packet) = framed.next() => {
-                let packet = packet?;
-                if let TunnResult::WriteToNetwork(data) = tunn.encapsulate(&packet, &mut wg_buf) {
-                    udp.send_to(data, peer_addr).await?;
-                }
-            }
-            Ok((len, _)) = udp.recv_from(&mut udp_buf) => {
-                match tunn.decapsulate(None, &udp_buf[..len], &mut wg_buf) {
-                    TunnResult::WriteToNetwork(response) => {
-                        udp.send_to(response, peer_addr).await?;
-                    }
-                    TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
-                        framed.send(packet.to_vec()).await?;
-                    }
-                    _ => {}
-                }
-            }
-        }
+    #[cfg(target_os = "macos")]
+    {
+        config.destination(Ipv4Addr::new(26, 26, 26, 1));
     }
+
+    #[cfg(target_os = "windows")]
+    {
+        config.tun_name("ShadowVPN");
+        let wintun = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|parent| parent.join("wintun.dll")))
+            .ok_or_else(|| anyhow::anyhow!("não foi possível localizar a pasta do executável"))?;
+        config.platform_config(|platform| {
+            platform.wintun_file(wintun);
+            platform.wait_for_interfaces(true, false, std::time::Duration::from_secs(5));
+        });
+    }
+
+    let device = tun::create_as_async(&config).map_err(tun_error)?;
+    Ok(device.into_framed())
+}
+
+fn tun_error(error: tun::Error) -> anyhow::Error {
+    #[cfg(target_os = "windows")]
+    let hint = "Execute como Administrador e mantenha wintun.dll ao lado do executável.";
+    #[cfg(target_os = "macos")]
+    let hint = "Execute com sudo para permitir a criação da interface utun.";
+    #[cfg(target_os = "linux")]
+    let hint = "Execute como root (ou conceda CAP_NET_ADMIN) e verifique se /dev/net/tun existe.";
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    let hint = "A criação da interface TUN exige privilégios administrativos.";
+
+    anyhow::anyhow!("falha ao criar a interface TUN: {error}. {hint}")
 }
