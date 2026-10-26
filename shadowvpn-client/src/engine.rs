@@ -8,8 +8,8 @@ use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 use futures::{SinkExt, StreamExt};
 use shadowvpn_core::{
-    encode_relay_packet, parse_relay_packet, valid_public_key, PeerInfo, RelayKind, HEARTBEAT_SECS,
-    RELAY_HEADER_LEN, VIRTUAL_NETWORK_PREFIX,
+    encode_relay_packet, parse_relay_packet, valid_public_key, PeerInfo, RegisterResponse,
+    RelayKind, HEARTBEAT_SECS, RELAY_HEADER_LEN, VIRTUAL_NETWORK_PREFIX,
 };
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -30,9 +30,11 @@ pub enum ClientEvent {
         virtual_ip: String,
         relay: String,
         public_key: String,
+        latency_ms: u64,
         peers: Vec<PeerInfo>,
     },
     Peers(Vec<PeerInfo>),
+    Latency(u64),
     Status(String),
     Error(String),
     Finished,
@@ -134,6 +136,7 @@ pub async fn run(
         &events,
         ClientEvent::Status("Registrando no grupo...".into()),
     );
+    let register_started = std::time::Instant::now();
     let registered = api
         .register(
             &config.group_name,
@@ -142,6 +145,7 @@ pub async fn run(
             &hostname,
         )
         .await?;
+    let register_latency_ms = register_started.elapsed().as_millis() as u64;
 
     let own_ip: Ipv4Addr = registered
         .virtual_ip
@@ -185,6 +189,7 @@ pub async fn run(
             virtual_ip: own_ip.to_string(),
             relay: relay.to_string(),
             public_key: public_key.clone(),
+            latency_ms: register_latency_ms,
             peers: peer_list.clone(),
         },
     );
@@ -236,7 +241,8 @@ async fn session_loop(
     let mut timer = interval(TIMER_INTERVAL);
     timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-    let (heartbeat_tx, mut heartbeat_rx) = tokio::sync::mpsc::channel(1);
+    let (heartbeat_tx, mut heartbeat_rx) =
+        tokio::sync::mpsc::channel::<(u64, anyhow::Result<RegisterResponse>)>(1);
     let heartbeat_api = api.clone();
     let heartbeat_config = config.clone();
     let heartbeat_public_key = public_key.to_string();
@@ -248,6 +254,7 @@ async fn session_loop(
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
+            let started = std::time::Instant::now();
             let result = heartbeat_api
                 .register(
                     &heartbeat_config.group_name,
@@ -256,7 +263,8 @@ async fn session_loop(
                     &heartbeat_hostname,
                 )
                 .await;
-            if heartbeat_tx.send(result).await.is_err() {
+            let latency_ms = started.elapsed().as_millis() as u64;
+            if heartbeat_tx.send((latency_ms, result)).await.is_err() {
                 break;
             }
         }
@@ -312,11 +320,12 @@ async fn session_loop(
                 }
             }
             result = heartbeat_rx.recv() => {
-                let Some(result) = result else {
+                let Some((latency_ms, result)) = result else {
                     bail!("a tarefa de heartbeat encerrou inesperadamente");
                 };
                 match result {
                     Ok(response) => {
+                        emit(events, ClientEvent::Latency(latency_ms));
                         if response.virtual_ip != own_ip.to_string() {
                             bail!("o servidor atribuiu um novo IP virtual; reconecte");
                         }

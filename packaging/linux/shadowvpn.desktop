@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=ShadowVPN
+GenericName=Private Group VPN
+Comment=Rede privada com WireGuard e relay próprio
+Exec=shadowvpn-gui
+Icon=shadowvpn
+Terminal=false
+Categories=Network;
+Keywords=VPN;WireGuard;network;private;
+StartupNotify=true

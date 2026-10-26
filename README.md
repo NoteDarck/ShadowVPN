@@ -14,12 +14,12 @@ ShadowVPN é uma VPN de grupo inspirada no Radmin VPN, escrita em Rust. Cada com
 - IP virtual estável por identidade enquanto a sessão estiver ativa.
 - Criptografia ponta a ponta WireGuard entre os peers.
 - Relay UDP no servidor, sem necessidade de port forwarding nos clientes.
-- Cliente CLI e GUI desktop (egui/eframe), com ícone e identidade visual próprios.
+- Cliente CLI e GUI desktop (egui/eframe) com visual escuro inspirado em VPNs de grupo, painel de rede, lista de computadores e status em tempo real.
 - Windows, Linux (x86_64 e aarch64) e macOS (Intel e Apple Silicon).
 - Identidade WireGuard persistente e reutilizada entre conexões.
 - Heartbeat, expiração de sessões e limpeza automática de peers inativos.
-- Nomes dos computadores exibidos na GUI.
-- Releases automatizados com checksums e `wintun.dll` no pacote Windows.
+- Nomes dos computadores e latência do servidor exibidos na GUI.
+- Releases automatizados com AppImage, instalador Windows, checksums e `wintun.dll` no pacote Windows.
 
 ## Como funciona
 
@@ -198,12 +198,20 @@ sudo env \
 
 Use um `SHADOWVPN_IDENTITY` explícito se quiser que a chave criada pelo processo root pertença ao seu usuário.
 
+O AppImage não carrega capabilities. Para usar a GUI empacotada, execute com `sudo`:
+
+```bash
+chmod +x ShadowVPN-v0.2.2-linux-x86_64.AppImage
+sudo -E ./ShadowVPN-v0.2.2-linux-x86_64.AppImage
+```
+
+Alternativamente, extraia o AppImage com `--appimage-extract` e aplique `CAP_NET_ADMIN` ao binário interno.
+
 ### Windows
 
-1. Extraia o ZIP.
-2. Mantenha `wintun.dll` e `wintun-LICENSE.txt` na mesma pasta.
-3. Clique com o botão direito em `shadowvpn-gui.exe` e escolha **Executar como administrador**.
-4. Permita a rede no firewall do Windows quando solicitado.
+1. Prefira o instalador `ShadowVPN-vX.Y.Z-windows-x86_64-setup.exe`; ele inclui o `wintun.dll` e registra o executável para solicitar elevação.
+2. Se usar o ZIP portátil, extraia, mantenha `wintun.dll` e `wintun-LICENSE.txt` na mesma pasta e execute `shadowvpn-gui.exe` como administrador.
+3. Permita a rede no firewall do Windows quando solicitado.
 
 Sem `wintun.dll`, a criação do TUN falha. O binário é x86_64.
 
@@ -216,7 +224,7 @@ sudo ./shadowvpn-client
 Se o arquivo foi baixado pelo navegador e o Gatekeeper bloquear:
 
 ```bash
-xattr -dr com.apple.quarantine ShadowVPN-v0.2.1-macos-aarch64
+xattr -dr com.apple.quarantine ShadowVPN-v0.2.2-macos-aarch64
 ```
 
 Os binários não são assinados nem notarizados.
@@ -225,23 +233,25 @@ Os binários não são assinados nem notarizados.
 
 Cada tag `v*` dispara `.github/workflows/release.yml` e publica:
 
-| Sistema | Pacote |
+| Sistema | Pacotes |
 |---|---|
-| Linux x86_64 | `ShadowVPN-vX.Y.Z-linux-x86_64.tar.gz` |
-| Linux aarch64 | `ShadowVPN-vX.Y.Z-linux-aarch64.tar.gz` |
-| Windows x86_64 | `ShadowVPN-vX.Y.Z-windows-x86_64.zip` |
+| Linux x86_64 | `ShadowVPN-vX.Y.Z-linux-x86_64.tar.gz` e `.AppImage` |
+| Linux aarch64 | `ShadowVPN-vX.Y.Z-linux-aarch64.tar.gz` e `.AppImage` |
+| Windows x86_64 | `ShadowVPN-vX.Y.Z-windows-x86_64.zip` e `-setup.exe` |
 | macOS Intel | `ShadowVPN-vX.Y.Z-macos-x86_64.tar.gz` |
 | macOS Apple Silicon | `ShadowVPN-vX.Y.Z-macos-aarch64.tar.gz` |
 
-Todos os pacotes incluem `shadowvpn-client`, `shadowvpn-server` e `shadowvpn-gui`. O pacote Windows inclui `wintun.dll` e a licença da Wintun. O release também publica `SHA256SUMS.txt`.
+Os arquivos compactados incluem `shadowvpn-client`, `shadowvpn-server` e `shadowvpn-gui`; os AppImages incluem os três binários, o arquivo `.desktop` e o ícone para integração com o desktop. O pacote Windows portátil e o instalador incluem `wintun.dll` e a licença da Wintun. O release também publica `SHA256SUMS.txt` com os checksums de todos os artefatos.
 
 Os binários Linux x86_64 são compilados no Ubuntu 22.04 (glibc 2.35) e os de aarch64 no Ubuntu 24.04 (glibc 2.39). A GUI Linux também precisa de bibliotecas de sistema para Wayland/X11 e OpenGL.
+
+O instalador Windows foi compilado com Inno Setup e registra `shadowvpn-gui.exe` com a camada de compatibilidade `RUNASADMIN`, para que o UAC seja solicitado ao abrir a GUI. O ZIP continua disponível para uso portátil.
 
 Para criar uma release:
 
 ```bash
-git tag v0.2.1
-git push origin v0.2.1
+git tag v0.2.2
+git push origin v0.2.2
 ```
 
 Também é possível executar o workflow manualmente em **Actions → Release multiplataforma → Run workflow**, informando uma tag que já exista no remoto.
@@ -275,8 +285,8 @@ Binários gerados em `target/release/`: `shadowvpn-server`, `shadowvpn-client` e
 - **Sem DNS próprio**: acesse os peers pelo IP virtual; os nomes são apenas exibidos na GUI.
 - **Estado em memória**: sem banco de dados; reiniciar o servidor perde grupos e sessões.
 - **Sem NAT traversal para o servidor**: o relay UDP precisa ser alcançável na porta publicada.
-- **Sem instalador, serviço ou inicialização automática**: os binários são portáveis.
-- **Sem assinatura de código**: Windows SmartScreen e macOS Gatekeeper podem avisar.
+- **Instalação limitada**: há instalador para Windows e AppImage para Linux; macOS continua apenas com binários portáveis. Não há serviço nem inicialização automática.
+- **Sem assinatura de código**: Windows SmartScreen, o instalador e o macOS Gatekeeper podem avisar.
 - **Sem túnel de internet completa**: apenas a sub-rede virtual é roteada.
 
 ## Solução de problemas

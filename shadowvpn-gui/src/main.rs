@@ -1,15 +1,33 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use eframe::egui;
+use eframe::egui::{
+    self, Align, Color32, Frame, Label, Layout, Margin, RichText, Rounding, Sense, Stroke,
+};
 use shadowvpn_client::{ClientConfig, ClientEvent, ClientHandle};
 use shadowvpn_core::PeerInfo;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+const BG: Color32 = Color32::from_rgb(8, 15, 26);
+const SIDEBAR_BG: Color32 = Color32::from_rgb(11, 21, 35);
+const CARD: Color32 = Color32::from_rgb(17, 30, 48);
+const CARD_ALT: Color32 = Color32::from_rgb(22, 38, 59);
+const CARD_HOVER: Color32 = Color32::from_rgb(27, 47, 71);
+const INPUT: Color32 = Color32::from_rgb(10, 20, 34);
+const BORDER: Color32 = Color32::from_rgb(32, 52, 76);
+const TEXT: Color32 = Color32::from_rgb(231, 240, 247);
+const MUTED: Color32 = Color32::from_rgb(139, 160, 179);
+const ACCENT: Color32 = Color32::from_rgb(73, 226, 197);
+const ACCENT_DARK: Color32 = Color32::from_rgb(20, 92, 82);
+const GREEN: Color32 = Color32::from_rgb(78, 210, 139);
+const AMBER: Color32 = Color32::from_rgb(238, 184, 88);
+const DANGER: Color32 = Color32::from_rgb(236, 103, 108);
+
 fn main() -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([760.0, 620.0])
-        .with_min_inner_size([620.0, 480.0]);
+        .with_inner_size([980.0, 700.0])
+        .with_min_inner_size([820.0, 580.0]);
     if let Some(icon) = load_window_icon() {
         viewport = viewport.with_icon(icon);
     }
@@ -32,6 +50,8 @@ struct ShadowVpnApp {
     password: String,
     identity_path: String,
     show_password: bool,
+    show_settings: bool,
+    styled: bool,
     logo: Option<egui::TextureHandle>,
     status: String,
     notice: Option<String>,
@@ -40,6 +60,7 @@ struct ShadowVpnApp {
     public_key: String,
     virtual_ip: String,
     relay: String,
+    latency_ms: Option<u64>,
     peers: Vec<PeerInfo>,
     handle: Option<ClientHandle>,
     connecting: bool,
@@ -55,6 +76,8 @@ impl Default for ShadowVpnApp {
             password: String::new(),
             identity_path: String::new(),
             show_password: false,
+            show_settings: false,
+            styled: false,
             logo: None,
             status: "Pronto para conectar".into(),
             notice: None,
@@ -63,6 +86,7 @@ impl Default for ShadowVpnApp {
             public_key: String::new(),
             virtual_ip: String::new(),
             relay: String::new(),
+            latency_ms: None,
             peers: Vec::new(),
             handle: None,
             connecting: false,
@@ -74,200 +98,805 @@ impl Default for ShadowVpnApp {
 
 impl eframe::App for ShadowVpnApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.styled {
+            configure_style(ctx);
+            self.styled = true;
+        }
+
         self.poll_events();
         self.ensure_logo(ctx);
-        ctx.request_repaint_after(Duration::from_millis(250));
+        ctx.request_repaint_after(Duration::from_millis(200));
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if let Some(logo) = &self.logo {
-                    ui.add(egui::Image::from_texture(egui::load::SizedTexture::new(
-                        logo.id(),
-                        egui::vec2(72.0, 72.0),
-                    )));
-                }
-                ui.vertical(|ui| {
-                    ui.heading("ShadowVPN");
-                    ui.label("Rede privada com WireGuard e relay próprio.");
-                });
+        self.top_bar(ctx);
+        self.sidebar(ctx);
+
+        egui::CentralPanel::default()
+            .frame(
+                Frame::none()
+                    .fill(BG)
+                    .inner_margin(Margin::symmetric(24.0, 20.0)),
+            )
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.main_content(ui);
+                    });
             });
-            ui.separator();
 
-            let busy = self.handle.is_some();
-            egui::Grid::new("config")
-                .num_columns(2)
-                .spacing([14.0, 8.0])
-                .show(ui, |ui| {
-                    ui.label("Servidor");
-                    ui.add_enabled(
-                        !busy,
-                        egui::TextEdit::singleline(&mut self.server)
-                            .desired_width(420.0)
-                            .hint_text("http://vpn.exemplo.com:8080"),
-                    );
-                    ui.end_row();
+        self.settings_window(ctx);
+    }
+}
 
-                    ui.label("Grupo");
-                    ui.add_enabled(
-                        !busy,
-                        egui::TextEdit::singleline(&mut self.group)
-                            .desired_width(220.0)
-                            .hint_text("minha-rede"),
-                    );
-                    ui.end_row();
+impl ShadowVpnApp {
+    fn top_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("top_bar")
+            .exact_height(64.0)
+            .frame(
+                Frame::none()
+                    .fill(BG)
+                    .inner_margin(Margin::symmetric(18.0, 10.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if let Some(logo) = &self.logo {
+                        ui.add(
+                            egui::Image::from_texture(egui::load::SizedTexture::new(
+                                logo.id(),
+                                egui::vec2(34.0, 34.0),
+                            ))
+                            .rounding(Rounding::same(9.0)),
+                        );
+                    }
+                    ui.add_space(4.0);
+                    ui.vertical(|ui| {
+                        ui.add_space(1.0);
+                        ui.label(RichText::new("ShadowVPN").size(19.0).strong().color(TEXT));
+                        ui.label(
+                            RichText::new("Sua rede privada, em qualquer lugar")
+                                .size(10.5)
+                                .color(MUTED),
+                        );
+                    });
 
-                    ui.label("Senha");
-                    ui.add_enabled(
-                        !busy,
-                        egui::TextEdit::singleline(&mut self.password)
-                            .password(!self.show_password)
-                            .desired_width(220.0),
-                    );
-                    ui.end_row();
-
-                    ui.label("Identidade");
-                    ui.add_enabled(
-                        !busy,
-                        egui::TextEdit::singleline(&mut self.identity_path)
-                            .desired_width(420.0)
-                            .hint_text("opcional: caminho da chave persistente"),
-                    );
-                    ui.end_row();
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let (label, color) = self.connection_status();
+                        pill(ui, label, color);
+                        ui.add_space(6.0);
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Configurações").size(12.0).color(TEXT),
+                                )
+                                .fill(CARD_ALT)
+                                .stroke(Stroke::new(1.0_f32, BORDER))
+                                .rounding(Rounding::same(8.0)),
+                            )
+                            .clicked()
+                        {
+                            self.show_settings = true;
+                        }
+                    });
                 });
+                let rect = ui.max_rect();
+                ui.painter().hline(
+                    rect.x_range(),
+                    rect.bottom() - 1.0,
+                    Stroke::new(1.0_f32, BORDER),
+                );
+            });
+    }
 
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.show_password, "Mostrar senha");
-                if ui
-                    .add_enabled(
-                        !busy,
-                        egui::Button::new(if self.connecting {
-                            "Conectando..."
+    fn sidebar(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("networks")
+            .exact_width(232.0)
+            .resizable(false)
+            .frame(
+                Frame::none()
+                    .fill(SIDEBAR_BG)
+                    .inner_margin(Margin::symmetric(14.0, 16.0)),
+            )
+            .show(ctx, |ui| {
+                ui.label(RichText::new("REDES").size(10.0).strong().color(MUTED));
+                ui.add_space(7.0);
+
+                let (_, state_color) = self.connection_status();
+                let group = self.group_name();
+                Frame::none()
+                    .fill(if self.connected { CARD_ALT } else { CARD })
+                    .stroke(Stroke::new(
+                        1.0_f32,
+                        if self.connected {
+                            ACCENT.gamma_multiply(0.35)
                         } else {
-                            "Conectar"
-                        }),
+                            BORDER
+                        },
+                    ))
+                    .rounding(Rounding::same(12.0))
+                    .inner_margin(Margin::same(12.0))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            status_dot(ui, state_color, 9.0);
+                            ui.add_space(2.0);
+                            ui.add(
+                                Label::new(RichText::new(group).size(14.5).strong().color(TEXT))
+                                    .truncate(),
+                            );
+                        });
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(if self.connected {
+                                "Rede privada • conectada"
+                            } else {
+                                "Rede privada"
+                            })
+                            .size(11.0)
+                            .color(MUTED),
+                        );
+                        if self.connected && !self.virtual_ip.is_empty() {
+                            ui.add_space(3.0);
+                            ui.label(
+                                RichText::new(&self.virtual_ip)
+                                    .monospace()
+                                    .size(12.5)
+                                    .color(ACCENT),
+                            );
+                        }
+                    });
+
+                ui.add_space(10.0);
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 32.0],
+                        egui::Button::new(
+                            RichText::new("Configurações da conexão")
+                                .size(11.5)
+                                .color(TEXT),
+                        )
+                        .fill(CARD)
+                        .stroke(Stroke::new(1.0_f32, BORDER))
+                        .rounding(Rounding::same(8.0)),
                     )
                     .clicked()
                 {
-                    self.connect();
+                    self.show_settings = true;
                 }
 
+                ui.add_space(18.0);
+                ui.label(RichText::new("SESSÃO").size(10.0).strong().color(MUTED));
+                ui.add_space(6.0);
+                let (state_label, state_color) = self.connection_status();
+                sidebar_stat(ui, "Status", state_label, state_color);
+                sidebar_stat(
+                    ui,
+                    "Servidor",
+                    if self.server.trim().is_empty() {
+                        "—"
+                    } else {
+                        self.server.trim()
+                    },
+                    TEXT,
+                );
+                if self.connected {
+                    sidebar_stat(
+                        ui,
+                        "Relay",
+                        if self.relay.is_empty() {
+                            "—"
+                        } else {
+                            &self.relay
+                        },
+                        TEXT,
+                    );
+                    let latency = self
+                        .latency_ms
+                        .map(|ms| format!("{ms} ms"))
+                        .unwrap_or_else(|| "—".into());
+                    sidebar_stat(ui, "Latência", &latency, TEXT);
+                } else {
+                    sidebar_stat(ui, "Computadores", "—", TEXT);
+                }
+
+                ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
+                    ui.label(
+                        RichText::new(format!("ShadowVPN v{}", env!("CARGO_PKG_VERSION")))
+                            .size(10.0)
+                            .color(MUTED),
+                    );
+                    ui.label(
+                        RichText::new("WireGuard + relay privado")
+                            .size(10.0)
+                            .color(MUTED),
+                    );
+                    ui.add_space(6.0);
+                    ui.separator();
+                });
+            });
+    }
+
+    fn main_content(&mut self, ui: &mut egui::Ui) {
+        if self.connected {
+            self.network_view(ui);
+        } else if self.connecting && self.error.is_none() {
+            self.connecting_view(ui);
+        } else {
+            self.connect_view(ui);
+        }
+    }
+
+    fn connect_view(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(8.0);
+        eyebrow(ui, "CONEXÃO");
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("Conecte-se a uma rede")
+                .size(28.0)
+                .strong()
+                .color(TEXT),
+        );
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new("Use os dados da rede compartilhados pelo administrador.")
+                .size(12.5)
+                .color(MUTED),
+        );
+        ui.add_space(16.0);
+
+        if let Some(error) = &self.error {
+            banner(ui, error, DANGER);
+            ui.add_space(10.0);
+        }
+        if let Some(notice) = &self.notice {
+            banner(ui, notice, AMBER);
+            ui.add_space(10.0);
+        }
+
+        Frame::none()
+            .fill(CARD)
+            .stroke(Stroke::new(1.0_f32, BORDER))
+            .rounding(Rounding::same(14.0))
+            .inner_margin(Margin::same(18.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                self.connection_fields(ui, false);
+            });
+
+        ui.add_space(14.0);
+        let busy = self.handle.is_some();
+        if primary_button(
+            ui,
+            if self.connecting {
+                "Conectando..."
+            } else {
+                "Conectar"
+            },
+            !busy,
+        ) {
+            self.connect();
+        }
+
+        ui.add_space(16.0);
+        ui.label(
+            RichText::new(
+                "A interface TUN exige privilégios de administrador. No Windows, mantenha \
+                 wintun.dll ao lado do executável.",
+            )
+            .size(10.5)
+            .color(MUTED),
+        );
+        ui.add_space(3.0);
+        ui.label(
+            RichText::new(
+                "O tráfego entre peers é cifrado com WireGuard; o servidor de relay não \
+                 consegue ler os pacotes.",
+            )
+            .size(10.5)
+            .color(MUTED),
+        );
+    }
+
+    fn connecting_view(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(54.0);
+        ui.vertical_centered(|ui| {
+            ui.add(egui::Spinner::new().size(30.0).color(ACCENT));
+            ui.add_space(14.0);
+            ui.label(
+                RichText::new("Conectando à rede")
+                    .size(25.0)
+                    .strong()
+                    .color(TEXT),
+            );
+            ui.add_space(3.0);
+            ui.label(RichText::new(self.group_name()).size(14.0).color(ACCENT));
+            ui.add_space(8.0);
+            ui.label(RichText::new(&self.status).size(12.0).color(MUTED));
+            ui.add_space(22.0);
+            if ui
+                .add_enabled(
+                    !self.stopping,
+                    egui::Button::new(
+                        RichText::new(if self.stopping {
+                            "Cancelando..."
+                        } else {
+                            "Cancelar"
+                        })
+                        .color(TEXT),
+                    )
+                    .fill(CARD_ALT)
+                    .stroke(Stroke::new(1.0_f32, BORDER))
+                    .rounding(Rounding::same(8.0))
+                    .min_size(egui::vec2(120.0, 34.0)),
+                )
+                .clicked()
+            {
+                self.disconnect();
+            }
+        });
+    }
+
+    fn network_view(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                eyebrow(ui, "REDE PRIVADA");
+                ui.add_space(3.0);
+                ui.label(
+                    RichText::new(self.group_name())
+                        .size(27.0)
+                        .strong()
+                        .color(TEXT),
+                );
+                ui.add_space(1.0);
+                ui.label(
+                    RichText::new(format!(
+                        "Rede virtual • {} de 253 computadores",
+                        self.peers.len() + 1
+                    ))
+                    .size(11.5)
+                    .color(MUTED),
+                );
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui
-                    .add_enabled(busy && !self.stopping, egui::Button::new("Desconectar"))
+                    .add_enabled(
+                        !self.stopping,
+                        egui::Button::new(
+                            RichText::new(if self.stopping {
+                                "Desconectando..."
+                            } else {
+                                "Desconectar"
+                            })
+                            .size(12.0)
+                            .color(Color32::from_rgb(255, 192, 194)),
+                        )
+                        .fill(Color32::from_rgb(83, 35, 45))
+                        .stroke(Stroke::new(1.0_f32, DANGER.gamma_multiply(0.65)))
+                        .rounding(Rounding::same(8.0))
+                        .min_size(egui::vec2(124.0, 34.0)),
+                    )
                     .clicked()
                 {
                     self.disconnect();
                 }
             });
+        });
 
-            ui.separator();
-
-            match &self.error {
-                Some(error) => {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(220, 80, 80),
-                        format!("Erro: {error}"),
-                    );
-                }
-                None => {
-                    let color = if self.connected {
-                        egui::Color32::from_rgb(70, 170, 90)
-                    } else {
-                        ui.visuals().text_color()
-                    };
-                    ui.colored_label(color, format!("Status: {}", self.status));
-                }
-            }
-
-            if let Some(notice) = &self.notice {
-                ui.colored_label(egui::Color32::from_rgb(190, 150, 40), notice);
-            }
-
-            if !self.virtual_ip.is_empty() {
-                ui.add_space(6.0);
-                egui::Grid::new("session")
-                    .num_columns(2)
-                    .spacing([14.0, 4.0])
-                    .show(ui, |ui| {
-                        ui.label("Nome");
-                        ui.monospace(&self.hostname);
-                        ui.end_row();
-
-                        ui.label("IP virtual");
-                        ui.monospace(&self.virtual_ip);
-                        ui.end_row();
-
-                        ui.label("Relay");
-                        ui.monospace(&self.relay);
-                        ui.end_row();
-
-                        ui.label("Chave pública");
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(&self.public_key).monospace())
-                                .selectable(true),
-                        );
-                        ui.end_row();
-                    });
-            }
-
+        ui.add_space(14.0);
+        if let Some(error) = &self.error {
+            banner(ui, error, DANGER);
             ui.add_space(10.0);
-            ui.heading("Peers");
-            if !self.connected {
-                ui.label("Conecte-se para listar os outros computadores do grupo.");
-            } else if self.peers.is_empty() {
-                ui.label("Nenhum outro peer conectado. Aguardando...");
-            } else {
-                egui::ScrollArea::vertical()
-                    .max_height(190.0)
-                    .show(ui, |ui| {
-                        egui::Grid::new("peers")
-                            .num_columns(4)
-                            .striped(true)
-                            .spacing([18.0, 4.0])
-                            .show(ui, |ui| {
-                                ui.strong("Nome");
-                                ui.strong("IP virtual");
-                                ui.strong("Sessão");
-                                ui.strong("Chave pública");
-                                ui.end_row();
+        }
+        if let Some(notice) = &self.notice {
+            banner(ui, notice, AMBER);
+            ui.add_space(10.0);
+        }
 
-                                for peer in &self.peers {
-                                    let name = if peer.hostname.is_empty() {
-                                        "Peer"
-                                    } else {
-                                        peer.hostname.as_str()
-                                    };
-                                    ui.label(name);
-                                    ui.monospace(&peer.virtual_ip);
-                                    ui.monospace(format!("{:016x}", peer.session_id));
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(short_key(&peer.public_key))
-                                                .monospace(),
+        let mut copied_ip = false;
+        let latency = self.latency_ms.map(|ms| format!("{ms} ms"));
+        let latency_color = match self.latency_ms {
+            Some(ms) if ms < 90 => GREEN,
+            Some(_) => AMBER,
+            None => MUTED,
+        };
+        Frame::none()
+            .fill(CARD)
+            .stroke(Stroke::new(1.0_f32, BORDER))
+            .rounding(Rounding::same(14.0))
+            .inner_margin(Margin::same(18.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.columns(4, |cols| {
+                    if metric(
+                        &mut cols[0],
+                        "SEU IP VIRTUAL",
+                        &self.virtual_ip,
+                        ACCENT,
+                        19.0,
+                        true,
+                        true,
+                    ) {
+                        copied_ip = true;
+                    }
+                    metric(
+                        &mut cols[1],
+                        "RELAY",
+                        if self.relay.is_empty() {
+                            "—"
+                        } else {
+                            &self.relay
+                        },
+                        TEXT,
+                        12.0,
+                        true,
+                        false,
+                    );
+                    metric(
+                        &mut cols[2],
+                        "LATÊNCIA DO SERVIDOR",
+                        latency.as_deref().unwrap_or("—"),
+                        latency_color,
+                        16.0,
+                        false,
+                        false,
+                    );
+                    metric(
+                        &mut cols[3],
+                        "COMPUTADORES",
+                        &format!("{} / 253", self.peers.len() + 1),
+                        TEXT,
+                        16.0,
+                        false,
+                        false,
+                    );
+                });
+            });
+        if copied_ip {
+            self.notice = Some("IP virtual copiado para a área de transferência.".into());
+        }
+
+        ui.add_space(14.0);
+        Frame::none()
+            .fill(CARD)
+            .stroke(Stroke::new(1.0_f32, BORDER))
+            .rounding(Rounding::same(14.0))
+            .inner_margin(Margin::same(18.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Computadores")
+                            .size(16.0)
+                            .strong()
+                            .color(TEXT),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(format!("{}", self.peers.len() + 1))
+                            .size(11.0)
+                            .color(MUTED),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new("Atualização automática")
+                                .size(10.0)
+                                .color(MUTED),
+                        );
+                    });
+                });
+                ui.add_space(8.0);
+
+                if self.peers.is_empty() {
+                    Frame::none()
+                        .fill(INPUT)
+                        .rounding(Rounding::same(10.0))
+                        .inner_margin(Margin::symmetric(18.0, 20.0))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.vertical_centered(|ui| {
+                                ui.label(
+                                    RichText::new("Aguardando outros computadores")
+                                        .size(13.0)
+                                        .strong()
+                                        .color(TEXT),
+                                );
+                                ui.add_space(3.0);
+                                ui.label(
+                                    RichText::new(
+                                        "Quando alguém entrar nesta rede, ele aparecerá aqui.",
+                                    )
+                                    .size(11.0)
+                                    .color(MUTED),
+                                );
+                            });
+                        });
+                } else {
+                    let mut peers: Vec<&PeerInfo> = self.peers.iter().collect();
+                    peers.sort_by_key(|peer| {
+                        peer.virtual_ip
+                            .parse::<Ipv4Addr>()
+                            .unwrap_or(Ipv4Addr::UNSPECIFIED)
+                    });
+                    egui::Grid::new("peer_grid")
+                        .num_columns(4)
+                        .spacing([16.0, 9.0])
+                        .show(ui, |ui| {
+                            table_header(ui, "COMPUTADOR");
+                            table_header(ui, "IP VIRTUAL");
+                            table_header(ui, "ESTADO");
+                            table_header(ui, "SESSÃO");
+                            ui.end_row();
+
+                            for peer in peers {
+                                let name = if peer.hostname.is_empty() {
+                                    "Peer"
+                                } else {
+                                    peer.hostname.as_str()
+                                };
+                                ui.horizontal(|ui| {
+                                    avatar(ui, name, &peer.public_key);
+                                    ui.add_sized(
+                                        [150.0, 20.0],
+                                        Label::new(
+                                            RichText::new(name).size(12.5).strong().color(TEXT),
                                         )
-                                        .selectable(true),
-                                    );
-                                    ui.end_row();
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(format!(
+                                        "{name}\n{}",
+                                        short_key(&peer.public_key)
+                                    ));
+                                });
+                                ui.label(
+                                    RichText::new(&peer.virtual_ip)
+                                        .monospace()
+                                        .size(12.0)
+                                        .color(TEXT),
+                                );
+                                ui.horizontal(|ui| {
+                                    status_dot(ui, GREEN, 7.0);
+                                    ui.label(RichText::new("Online").size(11.0).color(GREEN));
+                                });
+                                let short_session = peer.session_id as u32;
+                                ui.add(
+                                    Label::new(
+                                        RichText::new(format!("{short_session:08x}"))
+                                            .monospace()
+                                            .size(11.0)
+                                            .color(MUTED),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(format!("Sessão {:016x}", peer.session_id));
+                                ui.end_row();
+                            }
+                        });
+                }
+            });
+
+        ui.add_space(12.0);
+        egui::CollapsingHeader::new(
+            RichText::new("Detalhes da conexão")
+                .size(12.0)
+                .strong()
+                .color(MUTED),
+        )
+        .default_open(false)
+        .show(ui, |ui| {
+            Frame::none()
+                .fill(CARD)
+                .stroke(Stroke::new(1.0_f32, BORDER))
+                .rounding(Rounding::same(12.0))
+                .inner_margin(Margin::same(14.0))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    egui::Grid::new("connection_details")
+                        .num_columns(2)
+                        .spacing([20.0, 8.0])
+                        .show(ui, |ui| {
+                            detail_label(ui, "Nome");
+                            ui.label(
+                                RichText::new(if self.hostname.is_empty() {
+                                    "—"
+                                } else {
+                                    &self.hostname
+                                })
+                                .size(11.5)
+                                .color(TEXT),
+                            );
+                            ui.end_row();
+
+                            detail_label(ui, "Servidor");
+                            ui.label(
+                                RichText::new(&self.server)
+                                    .monospace()
+                                    .size(11.0)
+                                    .color(TEXT),
+                            );
+                            ui.end_row();
+
+                            detail_label(ui, "Chave pública");
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(short_key(&self.public_key))
+                                        .monospace()
+                                        .size(11.0)
+                                        .color(TEXT),
+                                );
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("copiar").size(9.5).color(MUTED),
+                                        )
+                                        .frame(false),
+                                    )
+                                    .clicked()
+                                {
+                                    ui.ctx().copy_text(self.public_key.clone());
                                 }
                             });
-                    });
-            }
+                            ui.end_row();
 
-            ui.add_space(12.0);
-            ui.separator();
-            ui.small(
-                "A GUI cria a interface TUN ao conectar. No Windows, execute como Administrador \
-                 e mantenha wintun.dll ao lado do executável. No Linux/macOS, execute com sudo \
-                 ou conceda CAP_NET_ADMIN.",
+                            detail_label(ui, "Identidade");
+                            ui.label(
+                                RichText::new(if self.identity_path.trim().is_empty() {
+                                    "padrão do sistema"
+                                } else {
+                                    self.identity_path.trim()
+                                })
+                                .size(11.0)
+                                .color(MUTED),
+                            );
+                            ui.end_row();
+                        });
+                });
+        });
+
+        ui.add_space(10.0);
+        ui.label(
+            RichText::new(
+                "O relay encaminha apenas pacotes WireGuard cifrados entre os membros da rede.",
+            )
+            .size(10.0)
+            .color(MUTED),
+        );
+    }
+
+    fn connection_fields(&mut self, ui: &mut egui::Ui, busy: bool) {
+        let enabled = !busy;
+        ui.columns(2, |cols| {
+            field_label(&mut cols[0], "SERVIDOR");
+            cols[0].add_enabled(
+                enabled,
+                egui::TextEdit::singleline(&mut self.server)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("http://vpn.exemplo.com:8080"),
             );
-            ui.small(
-                "O tráfego entre peers é cifrado com WireGuard. O servidor de relay não vê o \
-                 conteúdo dos pacotes.",
+
+            field_label(&mut cols[1], "REDE / GRUPO");
+            cols[1].add_enabled(
+                enabled,
+                egui::TextEdit::singleline(&mut self.group)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("minha-rede"),
             );
         });
-    }
-}
 
-impl ShadowVpnApp {
+        ui.add_space(10.0);
+        field_label(ui, "SENHA DA REDE");
+        ui.add_enabled(
+            enabled,
+            egui::TextEdit::singleline(&mut self.password)
+                .desired_width(f32::INFINITY)
+                .password(!self.show_password)
+                .hint_text("senha compartilhada pelo administrador"),
+        );
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.show_password, "Mostrar senha");
+        });
+
+        ui.add_space(10.0);
+        field_label(ui, "IDENTIDADE (OPCIONAL)");
+        ui.add_enabled(
+            enabled,
+            egui::TextEdit::singleline(&mut self.identity_path)
+                .desired_width(f32::INFINITY)
+                .hint_text("caminho da chave persistente"),
+        );
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("Se vazio, a chave é salva no diretório de configuração do sistema.")
+                .size(10.0)
+                .color(MUTED),
+        );
+    }
+
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.show_settings {
+            return;
+        }
+
+        let mut open = self.show_settings;
+        let mut close_requested = false;
+        egui::Window::new("Configurações")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(540.0)
+            .show(ctx, |ui| {
+                let busy = self.handle.is_some();
+                ui.label(
+                    RichText::new("Dados da conexão")
+                        .size(12.0)
+                        .strong()
+                        .color(TEXT),
+                );
+                ui.add_space(8.0);
+                self.connection_fields(ui, busy);
+                if busy {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Desconecte para alterar estes dados.")
+                            .size(10.5)
+                            .color(AMBER),
+                    );
+                }
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!("ShadowVPN v{}", env!("CARGO_PKG_VERSION")))
+                        .size(11.0)
+                        .color(MUTED),
+                );
+                ui.label(
+                    RichText::new("WireGuard para cifra • relay UDP próprio")
+                        .size(10.5)
+                        .color(MUTED),
+                );
+                ui.add_space(10.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("Fechar").color(TEXT))
+                                .fill(CARD_ALT)
+                                .stroke(Stroke::new(1.0_f32, BORDER))
+                                .rounding(Rounding::same(8.0)),
+                        )
+                        .clicked()
+                    {
+                        close_requested = true;
+                    }
+                });
+            });
+        if close_requested {
+            open = false;
+        }
+        self.show_settings = open;
+    }
+
+    fn connection_status(&self) -> (&'static str, Color32) {
+        if self.stopping {
+            ("Desconectando", AMBER)
+        } else if self.connected {
+            ("Conectado", GREEN)
+        } else if self.connecting {
+            ("Conectando", AMBER)
+        } else if self.error.is_some() {
+            ("Erro", DANGER)
+        } else {
+            ("Desconectado", MUTED)
+        }
+    }
+
+    fn group_name(&self) -> &str {
+        if self.group.trim().is_empty() {
+            "Minha rede"
+        } else {
+            self.group.trim()
+        }
+    }
+
     fn ensure_logo(&mut self, ctx: &egui::Context) {
         if self.logo.is_some() {
             return;
@@ -346,6 +975,7 @@ impl ShadowVpnApp {
                     virtual_ip,
                     relay,
                     public_key,
+                    latency_ms,
                     peers,
                 } => {
                     self.connected = true;
@@ -357,12 +987,16 @@ impl ShadowVpnApp {
                     self.virtual_ip = virtual_ip;
                     self.relay = relay;
                     self.public_key = public_key;
+                    self.latency_ms = Some(latency_ms);
                     self.peers = peers;
                     self.status = "Conectado".into();
                 }
                 ClientEvent::Peers(peers) => {
                     self.peers = peers;
                     self.notice = None;
+                }
+                ClientEvent::Latency(latency_ms) => {
+                    self.latency_ms = Some(latency_ms);
                 }
                 ClientEvent::Status(status) => {
                     if self.connected {
@@ -403,8 +1037,195 @@ impl ShadowVpnApp {
         self.public_key.clear();
         self.virtual_ip.clear();
         self.relay.clear();
+        self.latency_ms = None;
         self.peers.clear();
     }
+}
+
+fn configure_style(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    style.visuals = egui::Visuals::dark();
+    style.visuals.panel_fill = BG;
+    style.visuals.window_fill = SIDEBAR_BG;
+    style.visuals.extreme_bg_color = INPUT;
+    style.visuals.faint_bg_color = CARD_ALT;
+    style.visuals.hyperlink_color = ACCENT;
+    style.visuals.selection.bg_fill = ACCENT.gamma_multiply(0.35);
+    style.visuals.window_rounding = Rounding::same(14.0);
+    style.visuals.menu_rounding = Rounding::same(10.0);
+    style.visuals.widgets.noninteractive.fg_stroke.color = TEXT;
+    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+    style.visuals.widgets.inactive.fg_stroke.color = TEXT;
+    style.visuals.widgets.inactive.bg_fill = CARD_ALT;
+    style.visuals.widgets.inactive.weak_bg_fill = CARD_ALT;
+    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+    style.visuals.widgets.inactive.rounding = Rounding::same(8.0);
+    style.visuals.widgets.hovered.fg_stroke.color = TEXT;
+    style.visuals.widgets.hovered.bg_fill = CARD_HOVER;
+    style.visuals.widgets.hovered.weak_bg_fill = CARD_HOVER;
+    style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.55));
+    style.visuals.widgets.hovered.rounding = Rounding::same(8.0);
+    style.visuals.widgets.active.fg_stroke.color = TEXT;
+    style.visuals.widgets.active.bg_fill = ACCENT_DARK;
+    style.visuals.widgets.active.weak_bg_fill = ACCENT_DARK;
+    style.visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+    style.visuals.widgets.active.rounding = Rounding::same(8.0);
+    style.visuals.widgets.open.bg_fill = CARD_ALT;
+    style.visuals.widgets.open.fg_stroke.color = TEXT;
+    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+    style.spacing.button_padding = egui::vec2(12.0, 6.0);
+    style.spacing.interact_size.y = 30.0;
+    ctx.set_style(style);
+}
+
+fn eyebrow(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        RichText::new(text)
+            .size(9.5)
+            .strong()
+            .color(ACCENT.gamma_multiply(0.9)),
+    );
+}
+
+fn field_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(RichText::new(text).size(9.5).strong().color(MUTED));
+    ui.add_space(2.0);
+}
+
+fn table_header(ui: &mut egui::Ui, text: &str) {
+    ui.label(RichText::new(text).size(9.0).strong().color(MUTED));
+}
+
+fn detail_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(RichText::new(text).size(10.5).color(MUTED));
+}
+
+fn sidebar_stat(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).size(10.5).color(MUTED));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.add(Label::new(RichText::new(value).size(10.5).color(color)).truncate());
+        });
+    });
+}
+
+fn pill(ui: &mut egui::Ui, text: &str, color: Color32) {
+    Frame::none()
+        .fill(color.gamma_multiply(0.12))
+        .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.35)))
+        .rounding(Rounding::same(20.0))
+        .inner_margin(Margin::symmetric(9.0, 4.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                status_dot(ui, color, 7.0);
+                ui.add_space(1.0);
+                ui.label(RichText::new(text).size(10.5).color(color));
+            });
+        });
+}
+
+fn status_dot(ui: &mut egui::Ui, color: Color32, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), Sense::hover());
+    ui.painter().circle_filled(rect.center(), size / 2.0, color);
+}
+
+fn banner(ui: &mut egui::Ui, text: &str, color: Color32) {
+    Frame::none()
+        .fill(color.gamma_multiply(0.10))
+        .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.38)))
+        .rounding(Rounding::same(10.0))
+        .inner_margin(Margin::symmetric(12.0, 9.0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(text).size(11.0).color(color));
+        });
+}
+
+fn primary_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> bool {
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(
+            RichText::new(text)
+                .size(13.0)
+                .strong()
+                .color(Color32::from_rgb(5, 25, 23)),
+        )
+        .fill(ACCENT)
+        .stroke(Stroke::new(1.0_f32, ACCENT))
+        .rounding(Rounding::same(9.0))
+        .min_size(egui::vec2(150.0, 38.0)),
+    )
+    .clicked()
+}
+
+fn metric(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &str,
+    color: Color32,
+    size: f32,
+    monospace: bool,
+    copyable: bool,
+) -> bool {
+    ui.label(RichText::new(label).size(8.5).strong().color(MUTED));
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        let mut text = RichText::new(value).size(size).strong().color(color);
+        if monospace {
+            text = text.monospace();
+        }
+        let copy_width = if copyable { 42.0 } else { 0.0 };
+        let value_width = (ui.available_width() - copy_width).max(24.0);
+        ui.add_sized([value_width, size + 8.0], Label::new(text).truncate())
+            .on_hover_text(value.to_string());
+        let mut copied = false;
+        if copyable
+            && ui
+                .add(egui::Button::new(RichText::new("copiar").size(9.0).color(MUTED)).frame(false))
+                .clicked()
+        {
+            ui.ctx().copy_text(value.to_string());
+            copied = true;
+        }
+        copied
+    })
+    .inner
+}
+
+fn avatar(ui: &mut egui::Ui, name: &str, key: &str) {
+    let size = 26.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), Sense::hover());
+    let color = avatar_color(key);
+    ui.painter()
+        .circle_filled(rect.center(), size / 2.0, color.gamma_multiply(0.22));
+    let initial = name
+        .chars()
+        .find(|character| character.is_alphanumeric())
+        .unwrap_or('P')
+        .to_uppercase()
+        .to_string();
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        initial,
+        egui::FontId::proportional(12.0),
+        color,
+    );
+}
+
+fn avatar_color(key: &str) -> Color32 {
+    const PALETTE: [Color32; 6] = [
+        Color32::from_rgb(73, 226, 197),
+        Color32::from_rgb(104, 170, 255),
+        Color32::from_rgb(232, 160, 102),
+        Color32::from_rgb(210, 140, 235),
+        Color32::from_rgb(120, 214, 135),
+        Color32::from_rgb(238, 184, 88),
+    ];
+    let hash = key.bytes().fold(0u32, |hash, byte| {
+        hash.wrapping_mul(31).wrapping_add(byte as u32)
+    });
+    PALETTE[hash as usize % PALETTE.len()]
 }
 
 fn load_window_icon() -> Option<egui::IconData> {

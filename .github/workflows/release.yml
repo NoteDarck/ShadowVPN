@@ -31,8 +31,10 @@ jobs:
         include:
           - name: linux-x86_64
             os: ubuntu-22.04
+            appimage_arch: x86_64
           - name: linux-aarch64
             os: ubuntu-24.04-arm
+            appimage_arch: aarch64
           - name: windows-x86_64
             os: windows-2025
           - name: macos-x86_64
@@ -104,6 +106,66 @@ jobs:
             shasum -a 256 "$archive" > "${archive}.sha256"
           fi
 
+      - name: Empacotar AppImage
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+          APPIMAGE_ARCH: ${{ matrix.appimage_arch }}
+        run: |
+          set -euo pipefail
+          case "$APPIMAGE_ARCH" in
+            x86_64)
+              linuxdeploy_sha='c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d'
+              appimagetool_sha='ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0'
+              ;;
+            aarch64)
+              linuxdeploy_sha='620095110d693282b8ebeb244a95b5e911cf8f65f76c88b4b47d16ae6346fcff'
+              appimagetool_sha='f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158'
+              ;;
+            *)
+              echo "Arquitetura AppImage não suportada: $APPIMAGE_ARCH" >&2
+              exit 1
+              ;;
+          esac
+
+          tools="$RUNNER_TEMP/appimage-tools"
+          mkdir -p "$tools"
+          curl -fsSL -o "$tools/linuxdeploy.AppImage" \
+            "https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-${APPIMAGE_ARCH}.AppImage"
+          curl -fsSL -o "$tools/appimagetool.AppImage" \
+            "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-${APPIMAGE_ARCH}.AppImage"
+          echo "${linuxdeploy_sha}  $tools/linuxdeploy.AppImage" | sha256sum -c -
+          echo "${appimagetool_sha}  $tools/appimagetool.AppImage" | sha256sum -c -
+          chmod +x "$tools/linuxdeploy.AppImage" "$tools/appimagetool.AppImage"
+
+          dir="ShadowVPN-${TAG}-${{ matrix.name }}"
+          appdir="$RUNNER_TEMP/ShadowVPN.AppDir"
+          rm -rf "$appdir"
+          mkdir -p \
+            "$appdir/usr/bin" \
+            "$appdir/usr/share/applications" \
+            "$appdir/usr/share/icons/hicolor/512x512/apps"
+          cp target/release/shadowvpn-gui \
+             target/release/shadowvpn-client \
+             target/release/shadowvpn-server \
+             "$appdir/usr/bin/"
+          cp assets/icon.png "$appdir/shadowvpn.png"
+          cp assets/icon.png "$appdir/usr/share/icons/hicolor/512x512/apps/shadowvpn.png"
+          cp packaging/linux/shadowvpn.desktop "$appdir/shadowvpn.desktop"
+          cp packaging/linux/shadowvpn.desktop "$appdir/usr/share/applications/shadowvpn.desktop"
+
+          export ARCH="$APPIMAGE_ARCH"
+          APPIMAGE_EXTRACT_AND_RUN=1 "$tools/linuxdeploy.AppImage" \
+            --appdir "$appdir" \
+            --executable "$appdir/usr/bin/shadowvpn-gui" \
+            --desktop-file "$appdir/usr/share/applications/shadowvpn.desktop" \
+            --icon-file "$appdir/usr/share/icons/hicolor/512x512/apps/shadowvpn.png"
+          APPIMAGE_EXTRACT_AND_RUN=1 "$tools/appimagetool.AppImage" \
+            "$appdir" "${dir}.AppImage"
+          sha256sum "${dir}.AppImage" > "${dir}.AppImage.sha256"
+          file "${dir}.AppImage"
+
       - name: Empacotar (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -142,6 +204,33 @@ jobs:
             "$hash  $dir.zip`n"
           )
 
+          $version = $env:TAG.TrimStart('v')
+          $iscc = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) {
+            throw "Inno Setup não encontrado em $iscc"
+          }
+          $stageDir = (Resolve-Path $dir).Path
+          $outputDir = (Get-Location).Path
+          & $iscc `
+            "/DMyAppVersion=$version" `
+            "/DMyAppTag=$env:TAG" `
+            "/DStageDir=$stageDir" `
+            "/O$outputDir" `
+            "packaging\windows\shadowvpn.iss"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falha ao compilar o instalador Windows"
+          }
+
+          $setup = "ShadowVPN-$env:TAG-windows-x86_64-setup.exe"
+          if (-not (Test-Path $setup)) {
+            throw "Instalador não gerado: $setup"
+          }
+          $setupHash = (Get-FileHash -Algorithm SHA256 $setup).Hash.ToLowerInvariant()
+          [System.IO.File]::WriteAllText(
+            (Join-Path (Get-Location).Path "$setup.sha256"),
+            "$setupHash  $setup`n"
+          )
+
       - name: Publicar artefato do job
         uses: actions/upload-artifact@v4
         with:
@@ -151,6 +240,10 @@ jobs:
             ShadowVPN-*.tar.gz.sha256
             ShadowVPN-*.zip
             ShadowVPN-*.zip.sha256
+            ShadowVPN-*.AppImage
+            ShadowVPN-*.AppImage.sha256
+            ShadowVPN-*-setup.exe
+            ShadowVPN-*-setup.exe.sha256
           if-no-files-found: error
 
   publish:
@@ -175,7 +268,7 @@ jobs:
             sha256sum --check "$file"
           done
           cat *.sha256 | sort -k2 > SHA256SUMS.txt
-          rm -f ./*.tar.gz.sha256 ./*.zip.sha256
+          rm -f ./*.tar.gz.sha256 ./*.zip.sha256 ./*.AppImage.sha256 ./*-setup.exe.sha256
 
       - name: Criar release
         uses: softprops/action-gh-release@v2
@@ -186,5 +279,7 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.zip
+            dist/*.AppImage
+            dist/*-setup.exe
             dist/SHA256SUMS.txt
           fail_on_unmatched_files: true
