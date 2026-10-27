@@ -1,6 +1,6 @@
 # Como conectar no ShadowVPN
 
-Este guia cobre o fluxo da versão 0.4.0 em diante: primeiro alguém **cria a rede** no servidor, gera um **convite** e os outros computadores entram com o link e a senha. A rede fica salva mesmo quando todos desconectam ou o servidor reinicia.
+Este guia cobre o fluxo da versão 0.4.1 em diante: primeiro alguém **cria a rede** no servidor, gera um **convite** e os outros computadores entram com o link e a senha. A rede fica salva mesmo quando todos desconectam ou o servidor reinicia.
 
 ## O que você precisa
 
@@ -18,12 +18,30 @@ Criar a rede **não** exige privilégios especiais. Entrar/conectar exige.
 
 | Etapa | Quem faz | Ação |
 |---|---|---|
-| 1 | Administrador do servidor | Inicia `shadowvpn-server` |
+| 1 | Administrador do servidor | Inicia `shadowvpn-server` ou liga o **Servidor local** no painel da GUI |
 | 2 | Uma pessoa | Cria a rede com nome e senha e copia o convite |
 | 3 | Todos | Colam o convite, informam a senha e entram |
 | 4 | Todos | Testam o ping pelo IP virtual |
 
 ## 1. Iniciar o servidor
+
+### Pela GUI (servidor local)
+
+No painel esquerdo, localize o cartão **Servidor local**:
+
+- **Vermelho / Desligado:** clique no botão de energia para iniciar.
+- **Azul / Ligado:** clique no botão para encerrar.
+- **Iniciando...:** o servidor foi executado e a GUI aguarda o `/health`.
+
+Ao ligar, a GUI inicia o `shadowvpn-server` que acompanha o pacote e ajusta o campo do servidor para o IP da máquina na rede local, desde que ele estivesse em `127.0.0.1`/`localhost`. Assim o convite gerado pode ser aberto em outro computador.
+
+O servidor iniciado pela GUI escuta `0.0.0.0:8080` (TCP) e `0.0.0.0:8081` (UDP), grava as redes na pasta de dados do usuário e mantém o log em `server.log`:
+
+- Linux: `$XDG_DATA_HOME/shadowvpn/` ou `~/.local/share/shadowvpn/`
+- macOS: `~/Library/Application Support/shadowvpn/`
+- Windows: `%APPDATA%\ShadowVPN\`
+
+Se o cartão mostrar **Ligado por fora**, já existe um servidor nessa porta iniciado fora da GUI; encerre-o pelo terminal para controlá-lo pelo botão. O servidor iniciado pela GUI para quando a janela é fechada.
 
 ### Linux
 
@@ -282,6 +300,7 @@ A rede já foi criada. Não use `--create`; entre normalmente com o convite e a 
 
 ### "Connection refused" ou timeout no servidor
 
+- Se o servidor é nesta máquina, ligue o **Servidor local** no painel: vermelho significa desligado e azul significa ligado.
 - Confirme que o servidor está rodando.
 - Teste `curl http://IP:8080/health`.
 - Verifique firewall, NAT e se a porta TCP `8080` está publicada.

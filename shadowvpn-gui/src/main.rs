@@ -3,12 +3,15 @@
 use eframe::egui::{
     self, Align, Color32, Frame, Label, Layout, Margin, RichText, Rounding, Sense, Stroke,
 };
+use local_server::{is_loopback_url, relay_port, LocalServer, ToggleOutcome};
 use shadowvpn_client::{ClientConfig, ClientEvent, ClientHandle};
 use shadowvpn_core::{Invite, PeerInfo};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, TryRecvError};
 use std::time::Duration;
+
+mod local_server;
 
 const BG: Color32 = Color32::from_rgb(8, 15, 26);
 const SIDEBAR_BG: Color32 = Color32::from_rgb(11, 21, 35);
@@ -24,6 +27,7 @@ const ACCENT_DARK: Color32 = Color32::from_rgb(20, 92, 82);
 const GREEN: Color32 = Color32::from_rgb(78, 210, 139);
 const AMBER: Color32 = Color32::from_rgb(238, 184, 88);
 const DANGER: Color32 = Color32::from_rgb(236, 103, 108);
+const SERVER_ON: Color32 = Color32::from_rgb(70, 158, 255);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EntryMode {
@@ -81,6 +85,7 @@ struct ShadowVpnApp {
     connecting: bool,
     stopping: bool,
     connected: bool,
+    local_server: LocalServer,
 }
 
 impl Default for ShadowVpnApp {
@@ -115,6 +120,7 @@ impl Default for ShadowVpnApp {
             connecting: false,
             stopping: false,
             connected: false,
+            local_server: LocalServer::new(),
         }
     }
 }
@@ -127,6 +133,7 @@ impl eframe::App for ShadowVpnApp {
         }
 
         self.poll_events();
+        self.local_server.refresh();
         self.ensure_logo(ctx);
         ctx.request_repaint_after(Duration::from_millis(200));
 
@@ -211,6 +218,7 @@ impl ShadowVpnApp {
     }
 
     fn sidebar(&mut self, ctx: &egui::Context) {
+        let animation_time = ctx.input(|input| input.time);
         egui::SidePanel::left("networks")
             .exact_width(232.0)
             .resizable(false)
@@ -293,6 +301,9 @@ impl ShadowVpnApp {
                     self.show_settings = true;
                 }
 
+                ui.add_space(12.0);
+                self.local_server_card(ui, animation_time);
+
                 ui.add_space(18.0);
                 ui.label(RichText::new("SESSÃO").size(10.0).strong().color(MUTED));
                 ui.add_space(6.0);
@@ -334,6 +345,110 @@ impl ShadowVpnApp {
                     ui.separator();
                 });
             });
+    }
+
+    fn local_server_card(&mut self, ui: &mut egui::Ui, animation_time: f64) {
+        let snapshot = self.local_server.snapshot();
+        let active = snapshot.reachable || snapshot.starting;
+        let color = if active { SERVER_ON } else { DANGER };
+        let pulse = ((animation_time * 2.8).sin() as f32 * 0.5 + 0.5).clamp(0.0, 1.0);
+        let mut toggle = false;
+
+        Frame::none()
+            .fill(CARD)
+            .stroke(Stroke::new(1.0_f32, with_alpha(color, 80)))
+            .rounding(Rounding::same(12.0))
+            .inner_margin(Margin::same(10.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let response = server_power_button(ui, active, pulse);
+                    let tooltip = if snapshot.external {
+                        "Servidor ativo fora desta janela"
+                    } else if active {
+                        "Clique para desligar o servidor local"
+                    } else {
+                        "Clique para ligar o servidor local"
+                    };
+                    if response.clicked() {
+                        toggle = true;
+                    }
+                    response.on_hover_text(tooltip);
+
+                    ui.add_space(5.0);
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("SERVIDOR LOCAL")
+                                .size(9.0)
+                                .strong()
+                                .color(MUTED),
+                        );
+                        let status = if snapshot.reachable {
+                            if snapshot.external {
+                                "Ligado por fora"
+                            } else {
+                                "Ligado"
+                            }
+                        } else if snapshot.starting {
+                            "Iniciando..."
+                        } else {
+                            "Desligado"
+                        };
+                        ui.label(RichText::new(status).size(12.0).strong().color(color));
+                        let detail = if snapshot.reachable || snapshot.starting {
+                            snapshot.address.clone()
+                        } else {
+                            "Clique para ligar".into()
+                        };
+                        ui.add(Label::new(RichText::new(detail).size(9.5).color(MUTED)).truncate());
+                    });
+                });
+
+                if let Some(error) = &snapshot.error {
+                    ui.add_space(3.0);
+                    ui.label(RichText::new("Ver detalhes").size(9.0).color(DANGER))
+                        .on_hover_text(error);
+                }
+            });
+
+        ui.ctx().request_repaint_after(Duration::from_millis(50));
+        if toggle {
+            self.toggle_local_server();
+        }
+    }
+
+    fn toggle_local_server(&mut self) {
+        let use_lan_url = is_loopback_url(&self.server);
+        match self.local_server.toggle() {
+            ToggleOutcome::Started => {
+                if use_lan_url {
+                    self.server = self.local_server.url();
+                }
+                let address = self.local_server.snapshot().address;
+                self.notice = Some(format!(
+                    "Servidor local ligado em {address}. Libere as portas {}/tcp e {}/udp no firewall.",
+                    self.local_server.port(),
+                    relay_port()
+                ));
+                self.status = "Servidor local ligado".into();
+                self.error = None;
+            }
+            ToggleOutcome::Stopped => {
+                self.notice = Some("Servidor local desligado.".into());
+                self.status = "Servidor local desligado".into();
+            }
+            ToggleOutcome::External => {
+                let address = self.local_server.snapshot().address;
+                self.error = Some(format!(
+                    "Já existe um servidor ativo em {address}, iniciado fora desta janela. Encerre-o pelo terminal para controlá-lo aqui."
+                ));
+                self.status = "Servidor externo ativo".into();
+            }
+            ToggleOutcome::Failed(error) => {
+                self.error = Some(error);
+                self.status = "Falha ao ligar o servidor".into();
+            }
+        }
     }
 
     fn main_content(&mut self, ui: &mut egui::Ui) {
@@ -1433,6 +1548,57 @@ impl ShadowVpnApp {
         self.latency_ms = None;
         self.peers.clear();
     }
+}
+
+fn server_power_button(ui: &mut egui::Ui, on: bool, pulse: f32) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(52.0, 52.0), Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    let center = rect.center();
+    let color = if on { SERVER_ON } else { DANGER };
+    let hovered = response.hovered();
+    let glow = if hovered { 0.42 } else { 0.18 + pulse * 0.20 };
+    let painter = ui.painter();
+
+    painter.circle_filled(
+        center,
+        25.0 + pulse * 1.5,
+        with_alpha(color, (18.0 + glow * 40.0) as u8),
+    );
+    painter.circle_filled(center, 21.5, with_alpha(color, (22.0 + glow * 34.0) as u8));
+    painter.circle_filled(center, 19.0, Color32::from_rgb(13, 25, 41));
+    painter.circle_stroke(
+        center,
+        19.5,
+        Stroke::new(if hovered { 2.5_f32 } else { 2.0_f32 }, color),
+    );
+
+    let stroke = Stroke::new(2.0_f32, color);
+    painter.line_segment(
+        [
+            center + egui::vec2(0.0, -9.0),
+            center + egui::vec2(0.0, -1.5),
+        ],
+        stroke,
+    );
+    let radius = 8.0;
+    let start = -std::f32::consts::FRAC_PI_2 + 0.55;
+    let end = 3.0 * std::f32::consts::FRAC_PI_2 - 0.55;
+    let points: Vec<egui::Pos2> = (0..=28)
+        .map(|index| {
+            let angle = start + (end - start) * index as f32 / 28.0;
+            center + egui::vec2(angle.cos() * radius, angle.sin() * radius)
+        })
+        .collect();
+    painter.add(egui::Shape::line(points, stroke));
+
+    response
+}
+
+fn with_alpha(color: Color32, alpha: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
 }
 
 fn configure_style(ctx: &egui::Context) {
