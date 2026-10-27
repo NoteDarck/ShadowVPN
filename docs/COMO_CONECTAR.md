@@ -1,6 +1,6 @@
 # Como conectar no ShadowVPN
 
-Este guia cobre o fluxo da versão 0.4.1 em diante: primeiro alguém **cria a rede** no servidor, gera um **convite** e os outros computadores entram com o link e a senha. A rede fica salva mesmo quando todos desconectam ou o servidor reinicia.
+Este guia cobre o fluxo da versão 0.4.2 em diante: primeiro alguém **cria a rede** no servidor, gera um **convite** e os outros computadores entram com o link e a senha. A rede fica salva mesmo quando todos desconectam ou o servidor reinicia.
 
 ## O que você precisa
 
@@ -127,7 +127,19 @@ A rede precisa existir antes do primeiro `register`. Escolha uma das opções ab
 4. Quando aparecer a confirmação, use o cartão do convite e clique em copiar.
 5. Clique em **Entrar na rede** e envie o convite e a senha por canais separados.
 
-A GUI mantém a rede criada durante a sessão e já muda para o modo de entrada.
+A GUI salva automaticamente o convite da rede criada. Para recuperá-lo depois, abra a aba **Minhas redes**:
+
+- **Abrir** carrega a rede no modo de entrada e mostra o convite no cartão.
+- **Copiar** copia o link diretamente.
+- **Remover** tira a rede apenas da lista local; ela continua existindo no servidor.
+
+A senha não é salva. O arquivo `created-networks.txt` fica na pasta de dados do usuário:
+
+- Linux: `$XDG_DATA_HOME/shadowvpn/created-networks.txt` ou `~/.local/share/shadowvpn/created-networks.txt`
+- macOS: `~/Library/Application Support/shadowvpn/created-networks.txt`
+- Windows: `%APPDATA%\ShadowVPN\created-networks.txt`
+
+Ele contém um convite por linha e é separado do `networks.json` usado pelo servidor. Na primeira execução, se `created-networks.txt` ainda não existir, a GUI importa os nomes de redes já presentes no `networks.json` local. Com a lista vazia, o botão **Importar redes do servidor local** repete a importação.
 
 ### Pela CLI
 
@@ -155,7 +167,7 @@ shadowvpn://join?server=http%3A%2F%2Fvpn.exemplo.com%3A8080&network=minha-rede
 - A senha **não** é incluída. Envie-a por outro canal.
 - O link não cria um serviço central: alguém continua responsável por hospedar o servidor.
 
-Na GUI, o convite aparece após a criação e também pode ser copiado na tela da rede. Na CLI, ele aparece no log do `--create`. A API `POST /networks` não retorna o convite; monte o link com a URL do servidor e o nome da rede.
+Na GUI, o convite aparece após a criação, pode ser copiado na tela da rede e fica salvo na aba **Minhas redes**. Na CLI, ele aparece no log do `--create`. A API `POST /networks` não retorna o convite; monte o link com a URL do servidor e o nome da rede.
 
 ### Pela API HTTP
 
@@ -297,6 +309,14 @@ A rede ainda não existe no servidor. Crie-a na GUI/CLI com `--create`/`POST /ne
 ### "já existe uma rede com esse nome"
 
 A rede já foi criada. Não use `--create`; entre normalmente com o convite e a senha combinados. Se a senha estiver errada, a API não permite redefini-la: recrie a rede com o servidor parado.
+
+### A aba "Minhas redes" está vazia
+
+- Ela mostra apenas redes criadas pela GUI ou importadas do `networks.json` do servidor local.
+- Entrar em uma rede com convite não adiciona a rede à lista; o convite recebido continua no link original.
+- Use **Importar redes do servidor local** para trazer redes que já existem no servidor desta máquina.
+- Confirme que `created-networks.txt` existe na pasta de dados do usuário e que o arquivo não está vazio.
+- A senha não é salva na lista; ela sempre precisa ser informada ao entrar.
 
 ### "Connection refused" ou timeout no servidor
 

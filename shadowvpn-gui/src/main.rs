@@ -4,6 +4,7 @@ use eframe::egui::{
     self, Align, Color32, Frame, Label, Layout, Margin, RichText, Rounding, Sense, Stroke,
 };
 use local_server::{is_loopback_url, relay_port, LocalServer, ToggleOutcome};
+use saved_networks::{SavedNetwork, SavedNetworks};
 use shadowvpn_client::{ClientConfig, ClientEvent, ClientHandle};
 use shadowvpn_core::{Invite, PeerInfo};
 use std::net::Ipv4Addr;
@@ -11,7 +12,9 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, TryRecvError};
 use std::time::Duration;
 
+mod app_paths;
 mod local_server;
+mod saved_networks;
 
 const BG: Color32 = Color32::from_rgb(8, 15, 26);
 const SIDEBAR_BG: Color32 = Color32::from_rgb(11, 21, 35);
@@ -33,6 +36,24 @@ const SERVER_ON: Color32 = Color32::from_rgb(70, 158, 255);
 enum EntryMode {
     Create,
     Join,
+    Saved,
+}
+
+fn import_local_networks_into(saved: &mut SavedNetworks) -> Result<usize, String> {
+    let names = local_server::local_network_names()?;
+    if names.is_empty() {
+        return Ok(0);
+    }
+
+    let server = local_server::local_invite_server_url();
+    let invites = names
+        .iter()
+        .filter_map(|name| Invite::new(&server, name).ok())
+        .collect::<Vec<_>>();
+    if invites.is_empty() {
+        return Err("Nenhum nome de rede do servidor local pôde ser importado.".into());
+    }
+    saved.remember_all(&invites)
 }
 
 fn main() -> eframe::Result<()> {
@@ -66,7 +87,6 @@ struct ShadowVpnApp {
     entry_mode: EntryMode,
     creating_network: bool,
     create_result: Option<mpsc::Receiver<Result<(), String>>>,
-    created_network: Option<String>,
     invite_applied: bool,
     show_password: bool,
     show_settings: bool,
@@ -86,30 +106,54 @@ struct ShadowVpnApp {
     stopping: bool,
     connected: bool,
     local_server: LocalServer,
+    saved_networks: SavedNetworks,
 }
 
 impl Default for ShadowVpnApp {
     fn default() -> Self {
+        let mut saved_networks = SavedNetworks::load();
+        let mut notice = None;
+        let mut error = None;
+        if saved_networks.items().is_empty() && !saved_networks.path().exists() {
+            match import_local_networks_into(&mut saved_networks) {
+                Ok(0) => {}
+                Ok(added) => {
+                    notice = Some(format!(
+                        "{added} rede(s) do servidor local adicionada(s) a Minhas redes."
+                    ));
+                }
+                Err(failure) => error = Some(failure),
+            }
+        }
+        let latest = saved_networks.items().first();
+        let (server, group) = latest
+            .map(|network| (network.server.clone(), network.network.clone()))
+            .unwrap_or_else(|| ("http://127.0.0.1:8080".into(), "minha-rede".into()));
+        let entry_mode = if latest.is_some() {
+            EntryMode::Saved
+        } else {
+            EntryMode::Join
+        };
+
         Self {
-            server: "http://127.0.0.1:8080".into(),
-            group: "minha-rede".into(),
+            server,
+            group,
             password: String::new(),
             confirm_password: String::new(),
             identity_path: String::new(),
             invite_input: String::new(),
             identity_fingerprint: String::new(),
-            entry_mode: EntryMode::Join,
+            entry_mode,
             creating_network: false,
             create_result: None,
-            created_network: None,
             invite_applied: false,
             show_password: false,
             show_settings: false,
             styled: false,
             logo: None,
             status: "Pronto para conectar".into(),
-            notice: None,
-            error: None,
+            notice,
+            error,
             hostname: String::new(),
             public_key: String::new(),
             virtual_ip: String::new(),
@@ -121,6 +165,7 @@ impl Default for ShadowVpnApp {
             stopping: false,
             connected: false,
             local_server: LocalServer::new(),
+            saved_networks,
         }
     }
 }
@@ -233,6 +278,7 @@ impl ShadowVpnApp {
 
                 let (_, state_color) = self.connection_status();
                 let group = self.group_name();
+                let created = self.active_saved_network().is_some();
                 Frame::none()
                     .fill(if self.connected { CARD_ALT } else { CARD })
                     .stroke(Stroke::new(
@@ -256,12 +302,11 @@ impl ShadowVpnApp {
                             );
                         });
                         ui.add_space(4.0);
-                        let created = self.created_network_matches();
                         ui.label(
                             RichText::new(if self.connected {
                                 "Rede privada • conectada"
                             } else if created {
-                                "Rede criada • pronta para entrar"
+                                "Rede criada • convite disponível"
                             } else {
                                 "Rede privada"
                             })
@@ -464,11 +509,15 @@ impl ShadowVpnApp {
     fn connect_view(&mut self, ui: &mut egui::Ui) {
         let server_before = self.server.clone();
         let group_before = self.group.clone();
-        let password_before = self.password.clone();
 
         ui.add_space(8.0);
         self.entry_mode_selector(ui);
         ui.add_space(18.0);
+
+        if self.entry_mode == EntryMode::Saved {
+            self.saved_networks_view(ui);
+            return;
+        }
 
         let creating = self.entry_mode == EntryMode::Create;
         eyebrow(
@@ -528,14 +577,8 @@ impl ShadowVpnApp {
                 self.advanced_server(ui, busy);
             });
 
-        if self.server != server_before
-            || self.group != group_before
-            || self.password != password_before
-        {
-            self.created_network = None;
-            if !self.invite_applied {
-                self.notice = None;
-            }
+        if (self.server != server_before || self.group != group_before) && !self.invite_applied {
+            self.notice = None;
         }
         self.invite_applied = false;
 
@@ -557,7 +600,7 @@ impl ShadowVpnApp {
             }
         }
 
-        if !creating && self.created_network_matches() {
+        if !creating && self.active_saved_network().is_some() {
             ui.add_space(14.0);
             self.invite_card(ui);
         }
@@ -566,8 +609,8 @@ impl ShadowVpnApp {
         if creating {
             ui.label(
                 RichText::new(
-                    "Depois de criar, clique em Entrar na rede. Copie o convite e envie a \
-                     senha por um canal separado.",
+                    "Depois de criar, a rede fica salva em Minhas redes com o convite pronto \
+                     para copiar. Envie o link e a senha por canais separados.",
                 )
                 .size(10.5)
                 .color(MUTED),
@@ -615,17 +658,320 @@ impl ShadowVpnApp {
                     if mode_button(ui, "Entrar em rede", selected == EntryMode::Join) {
                         selected = EntryMode::Join;
                     }
+                    if mode_button(ui, "Minhas redes", selected == EntryMode::Saved) {
+                        selected = EntryMode::Saved;
+                    }
                 });
             });
 
-        if selected != self.entry_mode {
-            self.entry_mode = selected;
-            self.error = None;
-            self.notice = None;
-            self.status = match selected {
-                EntryMode::Create => "Preencha os dados da nova rede".into(),
-                EntryMode::Join => "Preencha os dados da rede".into(),
-            };
+        self.set_entry_mode(selected);
+    }
+
+    fn set_entry_mode(&mut self, selected: EntryMode) {
+        if selected == self.entry_mode {
+            return;
+        }
+        self.entry_mode = selected;
+        self.error = None;
+        self.notice = None;
+        self.status = match selected {
+            EntryMode::Create => "Preencha os dados da nova rede".into(),
+            EntryMode::Join => "Preencha os dados da rede".into(),
+            EntryMode::Saved => "Escolha uma rede criada por você".into(),
+        };
+    }
+
+    fn saved_networks_view(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(2.0);
+        eyebrow(ui, "MINHAS REDES");
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("Redes que você criou")
+                .size(28.0)
+                .strong()
+                .color(TEXT),
+        );
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new(
+                "Cada rede criada fica salva neste computador. Abra uma delas para recuperar o \
+                 convite. A senha não é armazenada.",
+            )
+            .size(12.5)
+            .color(MUTED),
+        );
+        ui.add_space(16.0);
+
+        if let Some(error) = &self.error {
+            banner(ui, error, DANGER);
+            ui.add_space(10.0);
+        }
+        let saved_error = self.saved_networks.error().map(str::to_owned);
+        if let Some(error) = saved_error.as_deref() {
+            if self.error.as_deref() != Some(error) {
+                banner(ui, error, DANGER);
+                ui.add_space(10.0);
+            }
+        }
+        if let Some(notice) = &self.notice {
+            banner(ui, notice, ACCENT);
+            ui.add_space(10.0);
+        }
+
+        if self.saved_networks.items().is_empty() {
+            Frame::none()
+                .fill(CARD)
+                .stroke(Stroke::new(1.0_f32, BORDER))
+                .rounding(Rounding::same(14.0))
+                .inner_margin(Margin::same(20.0))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(
+                        RichText::new("Nenhuma rede criada ainda")
+                            .size(16.0)
+                            .strong()
+                            .color(TEXT),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "Ao criar uma rede, ela aparecerá aqui com o convite pronto para \
+                             copiar, mesmo depois de fechar o ShadowVPN.",
+                        )
+                        .size(11.5)
+                        .color(MUTED),
+                    );
+                    ui.add_space(12.0);
+                    if primary_button(ui, "Criar minha primeira rede", true) {
+                        self.set_entry_mode(EntryMode::Create);
+                    }
+                    ui.add_space(6.0);
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("Importar redes do servidor local")
+                                    .size(11.5)
+                                    .color(ACCENT),
+                            )
+                            .frame(false),
+                        )
+                        .on_hover_text(
+                            "Adiciona à lista as redes que já existem no networks.json local.",
+                        )
+                        .clicked()
+                    {
+                        self.import_local_networks();
+                    }
+                });
+            return;
+        }
+
+        let networks = self.saved_networks.items().to_vec();
+        let mut open_index = None;
+        let mut copy_index = None;
+        let mut remove_index = None;
+
+        for (index, network) in networks.iter().enumerate() {
+            let active = self
+                .active_saved_network()
+                .map(|saved| saved == network)
+                .unwrap_or(false);
+            let invite = network.invite_url().unwrap_or_default();
+
+            Frame::none()
+                .fill(if active { CARD_ALT } else { CARD })
+                .stroke(Stroke::new(
+                    1.0_f32,
+                    if active {
+                        ACCENT.gamma_multiply(0.35)
+                    } else {
+                        BORDER
+                    },
+                ))
+                .rounding(Rounding::same(12.0))
+                .inner_margin(Margin::same(14.0))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        status_dot(ui, if active { ACCENT } else { MUTED }, 8.0);
+                        ui.add_space(2.0);
+                        ui.vertical(|ui| {
+                            ui.add(
+                                Label::new(
+                                    RichText::new(&network.network)
+                                        .size(15.0)
+                                        .strong()
+                                        .color(TEXT),
+                                )
+                                .truncate(),
+                            );
+                            ui.add(
+                                Label::new(RichText::new(&network.server).size(10.5).color(MUTED))
+                                    .truncate(),
+                            );
+                        });
+
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("Remover").size(10.5).color(DANGER),
+                                    )
+                                    .frame(false),
+                                )
+                                .on_hover_text(
+                                    "Remove apenas desta lista; a rede continua no servidor.",
+                                )
+                                .clicked()
+                            {
+                                remove_index = Some(index);
+                            }
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("Copiar").size(10.5).color(TEXT),
+                                    )
+                                    .fill(CARD)
+                                    .stroke(Stroke::new(1.0_f32, BORDER))
+                                    .rounding(Rounding::same(7.0)),
+                                )
+                                .clicked()
+                            {
+                                copy_index = Some(index);
+                            }
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("Abrir").size(10.5).color(TEXT),
+                                    )
+                                    .fill(ACCENT_DARK)
+                                    .stroke(Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.5)))
+                                    .rounding(Rounding::same(7.0)),
+                                )
+                                .clicked()
+                            {
+                                open_index = Some(index);
+                            }
+                        });
+                    });
+
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(if active { "SELECIONADA" } else { "CONVITE" })
+                                .size(8.5)
+                                .strong()
+                                .color(if active { ACCENT } else { MUTED }),
+                        );
+                        if invite.is_empty() {
+                            ui.label(RichText::new("convite inválido").size(10.0).color(DANGER));
+                        } else {
+                            ui.add(
+                                Label::new(
+                                    RichText::new(&invite).monospace().size(10.0).color(MUTED),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(&invite);
+                        }
+                    });
+                });
+            ui.add_space(10.0);
+        }
+
+        if let Some(index) = copy_index {
+            if let Some(url) = networks.get(index).and_then(SavedNetwork::invite_url) {
+                ui.ctx().copy_text(url);
+                self.notice = Some("Convite copiado. Envie o link e a senha separadamente.".into());
+            }
+        }
+        if let Some(index) = remove_index {
+            self.remove_saved_network(index);
+        }
+        if let Some(index) = open_index {
+            self.open_saved_network(index);
+        }
+
+        ui.add_space(4.0);
+        let path = self.saved_networks.path().display().to_string();
+        ui.add(
+            Label::new(
+                RichText::new(format!("Arquivo: {path}"))
+                    .monospace()
+                    .size(9.0)
+                    .color(MUTED),
+            )
+            .truncate(),
+        )
+        .on_hover_text(path);
+    }
+
+    fn open_saved_network(&mut self, index: usize) {
+        let Some(network) = self.saved_networks.items().get(index).cloned() else {
+            return;
+        };
+        if self.server != network.server || self.group.trim() != network.network {
+            self.password.clear();
+            self.confirm_password.clear();
+        }
+        self.server = network.server;
+        self.group = network.network.clone();
+        self.entry_mode = EntryMode::Join;
+        self.error = None;
+        self.notice = Some(format!(
+            "Rede \"{}\" carregada. O convite está pronto para ser copiado.",
+            network.network
+        ));
+        self.status = "Rede carregada".into();
+    }
+
+    fn remove_saved_network(&mut self, index: usize) {
+        match self.saved_networks.remove(index) {
+            Ok(network) => {
+                self.error = None;
+                self.notice = Some(format!(
+                    "Rede \"{}\" removida da lista. A rede continua no servidor.",
+                    network.network
+                ));
+                self.status = "Rede removida da lista".into();
+            }
+            Err(error) => {
+                self.error = Some(error);
+                self.status = "Falha ao atualizar as redes salvas".into();
+            }
+        }
+    }
+
+    fn import_local_networks(&mut self) {
+        match import_local_networks_into(&mut self.saved_networks) {
+            Ok(0) => {
+                self.error = None;
+                self.notice = Some(
+                    "Nenhuma rede nova encontrada no servidor local. Crie uma rede primeiro."
+                        .into(),
+                );
+                self.status = "Nenhuma rede local para importar".into();
+            }
+            Ok(added) => {
+                self.error = None;
+                self.notice = Some(format!(
+                    "{added} rede(s) do servidor local adicionada(s) a Minhas redes."
+                ));
+                if let Some(latest) = self.saved_networks.items().first().cloned() {
+                    if self.server != latest.server || self.group.trim() != latest.network {
+                        self.password.clear();
+                        self.confirm_password.clear();
+                    }
+                    self.server = latest.server;
+                    self.group = latest.network;
+                }
+                self.status = "Redes do servidor local importadas".into();
+            }
+            Err(failure) => {
+                self.notice = None;
+                self.error = Some(failure);
+                self.status = "Falha ao importar as redes locais".into();
+            }
         }
     }
 
@@ -1161,7 +1507,6 @@ impl ShadowVpnApp {
                 self.group = invite.network;
                 self.entry_mode = EntryMode::Join;
                 self.invite_input.clear();
-                self.created_network = None;
                 self.invite_applied = true;
                 self.error = None;
                 self.notice = Some("Convite aplicado. Informe a senha da rede.".into());
@@ -1307,7 +1652,7 @@ impl ShadowVpnApp {
             ("Criando rede", AMBER)
         } else if self.connecting {
             ("Conectando", AMBER)
-        } else if self.created_network_matches() {
+        } else if self.active_saved_network().is_some() {
             ("Rede criada", ACCENT)
         } else if self.error.is_some() {
             ("Erro", DANGER)
@@ -1316,11 +1661,12 @@ impl ShadowVpnApp {
         }
     }
 
-    fn created_network_matches(&self) -> bool {
-        self.created_network
-            .as_deref()
-            .map(|network| network == self.group_name())
-            .unwrap_or(false)
+    fn active_saved_network(&self) -> Option<&SavedNetwork> {
+        let invite = Invite::new(self.server.trim(), self.group.trim()).ok()?;
+        self.saved_networks
+            .items()
+            .iter()
+            .find(|saved| saved.server == invite.server && saved.network == invite.network)
     }
 
     fn group_name(&self) -> &str {
@@ -1351,7 +1697,6 @@ impl ShadowVpnApp {
     fn create_network(&mut self) {
         self.error = None;
         self.notice = None;
-        self.created_network = None;
 
         if self.password != self.confirm_password {
             self.error = Some("As senhas não coincidem.".into());
@@ -1403,12 +1748,29 @@ impl ShadowVpnApp {
         match result {
             Ok(()) => {
                 let network = self.group.trim().to_string();
-                self.created_network = Some(network.clone());
                 self.entry_mode = EntryMode::Join;
-                self.notice = Some(format!(
-                    "Rede \"{network}\" criada no servidor. Agora clique em Entrar na rede."
-                ));
-                self.status = "Rede criada".into();
+                match Invite::new(self.server.trim(), &network) {
+                    Ok(invite) => match self.saved_networks.remember(&invite) {
+                        Ok(()) => {
+                            self.notice = Some(format!(
+                                "Rede \"{network}\" criada e salva em Minhas redes. O convite está pronto para copiar."
+                            ));
+                            self.status = "Rede criada e salva".into();
+                        }
+                        Err(error) => {
+                            self.error = Some(format!(
+                                "Rede \"{network}\" criada, mas não foi possível salvá-la na lista: {error}"
+                            ));
+                            self.status = "Rede criada; falha ao salvar convite".into();
+                        }
+                    },
+                    Err(error) => {
+                        self.error = Some(format!(
+                            "Rede \"{network}\" criada, mas o convite não pôde ser gerado: {error}"
+                        ));
+                        self.status = "Rede criada; convite inválido".into();
+                    }
+                }
             }
             Err(error) => {
                 self.error = Some(error);

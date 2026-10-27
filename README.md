@@ -19,6 +19,7 @@ ShadowVPN é uma VPN de grupo inspirada no Radmin VPN, escrita em Rust. Cada com
 - Relay UDP no servidor, sem necessidade de port forwarding nos clientes.
 - Cliente CLI e GUI desktop (egui/eframe) com visual escuro inspirado em VPNs de grupo, painel de rede, lista de computadores e status em tempo real.
 - Botão **Servidor local** no painel, com animação vermelha quando desligado e azul quando ligado.
+- Aba **Minhas redes** que guarda os convites das redes criadas neste computador.
 - Windows, Linux (x86_64 e aarch64) e macOS (Intel e Apple Silicon).
 - Redes sobrevivem a reinícios do servidor; sessões e peers continuam em memória.
 - Heartbeat, expiração de sessões e limpeza automática de peers inativos.
@@ -131,10 +132,13 @@ Para parar, pressione `Ctrl+C`. O cliente remove o peer do grupo e encerra a int
 cargo run --release -p shadowvpn-gui
 ```
 
-A GUI oferece dois modos:
+A GUI oferece três modos:
 
-- **Criar rede**: define nome e senha, cria a rede no servidor e depois permite copiar o convite.
+- **Criar rede**: define nome e senha, cria a rede no servidor e salva o convite em **Minhas redes**.
 - **Entrar em rede**: recebe um link de convite e a senha da rede.
+- **Minhas redes**: lista as redes que você criou neste computador e permite abrir a rede ou copiar o convite novamente.
+
+Na aba **Minhas redes**, use **Abrir** para carregar a rede e mostrar o convite, **Copiar** para copiar o link diretamente ou **Remover** para tirar a rede da lista local. Remover da lista não apaga a rede do servidor. A senha nunca é salva; mantenha-a em um gerenciador de senhas ou em local seguro.
 
 O painel lateral tem o cartão **Servidor local**, com um botão de energia animado:
 
@@ -178,7 +182,15 @@ A identidade XEdDSA é derivada da mesma chave WireGuard persistente, criada aut
 
 O arquivo tem permissão restrita no Unix. Se duas pessoas usarem a mesma identidade ao mesmo tempo, o servidor as tratará como o mesmo peer.
 
-Quando o servidor é iniciado pelo botão **Servidor local** da GUI, o arquivo de redes fica em:
+Os convites das redes que você criou pela GUI ficam em `created-networks.txt`:
+
+- Linux: `$XDG_DATA_HOME/shadowvpn/created-networks.txt` ou `~/.local/share/shadowvpn/created-networks.txt`
+- macOS: `~/Library/Application Support/shadowvpn/created-networks.txt`
+- Windows: `%APPDATA%\ShadowVPN\created-networks.txt`
+
+O arquivo contém um link de convite por linha — servidor e nome da rede, nunca a senha — e recebe permissão `0600` no Unix. Ele é separado do `networks.json` do servidor. Se a lista ainda não existir, a GUI importa automaticamente os nomes de redes do `networks.json` local; quando a lista está vazia, o botão **Importar redes do servidor local** repete a importação.
+
+Quando o servidor é iniciado pelo botão **Servidor local** da GUI, o arquivo de redes do servidor fica em:
 
 - Linux: `$XDG_DATA_HOME/shadowvpn/networks.json` ou `~/.local/share/shadowvpn/networks.json`
 - macOS: `~/Library/Application Support/shadowvpn/networks.json`
@@ -259,8 +271,8 @@ Use um `SHADOWVPN_IDENTITY` explícito se quiser que a chave criada pelo process
 O AppImage não carrega capabilities. Para usar a GUI empacotada, execute com `sudo`:
 
 ```bash
-chmod +x ShadowVPN-v0.4.1-linux-x86_64.AppImage
-sudo -E ./ShadowVPN-v0.4.1-linux-x86_64.AppImage
+chmod +x ShadowVPN-v0.4.2-linux-x86_64.AppImage
+sudo -E ./ShadowVPN-v0.4.2-linux-x86_64.AppImage
 ```
 
 Alternativamente, extraia o AppImage com `--appimage-extract` e aplique `CAP_NET_ADMIN` ao binário interno.
@@ -283,7 +295,7 @@ sudo ./shadowvpn-client
 Se o arquivo foi baixado pelo navegador e o Gatekeeper bloquear:
 
 ```bash
-xattr -dr com.apple.quarantine ShadowVPN-v0.4.1-macos-aarch64
+xattr -dr com.apple.quarantine ShadowVPN-v0.4.2-macos-aarch64
 ```
 
 Os binários não são assinados nem notarizados.
@@ -309,8 +321,8 @@ O instalador Windows foi compilado com Inno Setup e registra `shadowvpn-gui.exe`
 Para criar uma release:
 
 ```bash
-git tag v0.4.1
-git push origin v0.4.1
+git tag v0.4.2
+git push origin v0.4.2
 ```
 
 Também é possível executar o workflow manualmente em **Actions → Release multiplataforma → Run workflow**, informando uma tag que já exista no remoto.

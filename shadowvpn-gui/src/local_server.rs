@@ -1,9 +1,12 @@
+use crate::app_paths;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+use serde_json::Value;
 
 const DEFAULT_PORT: u16 = 8080;
 const PROBE_INTERVAL: Duration = Duration::from_secs(1);
@@ -147,7 +150,7 @@ impl LocalServer {
 
     fn start(&mut self) -> Result<(), String> {
         let executable = server_executable();
-        let networks_file = networks_file();
+        let networks_file = app_paths::server_networks_path();
         self.log_path = None;
         if let Some(parent) = networks_file.parent() {
             if !parent.as_os_str().is_empty() {
@@ -298,6 +301,49 @@ pub fn relay_port() -> u16 {
         .unwrap_or(8081)
 }
 
+pub fn local_invite_server_url() -> String {
+    let listen = listen_address();
+    let host = match listen.ip() {
+        IpAddr::V4(address) if !address.is_unspecified() => address.to_string(),
+        IpAddr::V6(address) if !address.is_unspecified() => {
+            return format!("http://[{address}]:{}", listen.port());
+        }
+        _ => lan_ipv4().unwrap_or(Ipv4Addr::LOCALHOST).to_string(),
+    };
+    format!("http://{host}:{}", listen.port())
+}
+
+pub fn local_network_names() -> Result<Vec<String>, String> {
+    let path = app_paths::server_networks_path();
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "Não foi possível ler as redes do servidor local em {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    parse_network_names(&content).map_err(|error| {
+        format!(
+            "Não foi possível interpretar as redes do servidor local em {}: {error}",
+            path.display()
+        )
+    })
+}
+
+fn parse_network_names(content: &str) -> Result<Vec<String>, String> {
+    let value: Value = serde_json::from_str(content).map_err(|error| error.to_string())?;
+    let networks = value
+        .get("networks")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "campo networks ausente".to_string())?;
+    let mut names = networks.keys().cloned().collect::<Vec<_>>();
+    names.sort();
+    Ok(names)
+}
+
 fn lan_ipv4() -> Option<Ipv4Addr> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
@@ -320,43 +366,6 @@ fn open_log(path: &Path) -> std::io::Result<File> {
     options.open(path)
 }
 
-fn networks_file() -> PathBuf {
-    if let Some(path) = std::env::var_os("SHADOWVPN_NETWORKS_FILE") {
-        return PathBuf::from(path);
-    }
-
-    if let Some(base) = data_dir() {
-        return base.join("shadowvpn").join("networks.json");
-    }
-    PathBuf::from("data").join("networks.json")
-}
-
-fn data_dir() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        std::env::var_os("APPDATA").map(PathBuf::from)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|home| home.join("Library").join("Application Support"))
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .map(|home| PathBuf::from(home).join(".local").join("share"))
-            })
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,6 +380,23 @@ mod tests {
         assert!(is_loopback_url("https://[::1]:8080"));
         assert!(!is_loopback_url("http://192.168.1.10:8080"));
         assert!(!is_loopback_url("https://vpn.example.com"));
+    }
+
+    #[test]
+    fn reads_network_names_from_the_server_file() {
+        let content = r#"{
+            "version": 1,
+            "networks": {
+                "trabalho": {"password_hash": "hash"},
+                "ShadowServer": {"password_hash": "hash"}
+            }
+        }"#;
+        assert_eq!(
+            parse_network_names(content).unwrap(),
+            vec!["ShadowServer".to_string(), "trabalho".to_string()]
+        );
+        assert!(parse_network_names("{}").is_err());
+        assert!(parse_network_names("não é json").is_err());
     }
 
     #[test]
