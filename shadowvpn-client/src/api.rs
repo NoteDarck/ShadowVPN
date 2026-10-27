@@ -3,8 +3,8 @@ use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use shadowvpn_core::{
-    CreateNetworkRequest, CreateNetworkResponse, ErrorResponse, PeersRequest, PeersResponse,
-    RegisterRequest, RegisterResponse, UnregisterRequest,
+    CreateNetworkRequest, CreateNetworkResponse, ErrorResponse, PeerIdentity, PeersRequest,
+    PeersResponse, RegisterRequest, RegisterResponse, UnregisterRequest,
 };
 use std::time::Duration;
 
@@ -54,6 +54,7 @@ impl Api {
         group_name: &str,
         group_password: &str,
         public_key: &str,
+        identity: &PeerIdentity,
         hostname: &str,
     ) -> Result<RegisterResponse> {
         self.post_json(
@@ -62,6 +63,7 @@ impl Api {
                 group_name: group_name.to_string(),
                 group_password: group_password.to_string(),
                 public_key: public_key.to_string(),
+                identity: identity.clone(),
                 hostname: hostname.to_string(),
             },
         )

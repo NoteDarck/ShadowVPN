@@ -27,6 +27,9 @@ fn state_error(error: StateError) -> ApiError {
         StateError::InvalidCredentials => {
             api_error(StatusCode::UNAUTHORIZED, "senha ou grupo inválidos")
         }
+        StateError::InvalidIdentity => {
+            api_error(StatusCode::BAD_REQUEST, "identidade WireGuard inválida")
+        }
         StateError::NetworkNotFound => api_error(
             StatusCode::NOT_FOUND,
             "rede não encontrada; crie a rede primeiro",
@@ -91,6 +94,7 @@ pub async fn register(
             &req.group_name,
             &req.group_password,
             &req.public_key,
+            &req.identity,
             &hostname,
         )
         .map_err(state_error)?;
@@ -164,7 +168,6 @@ pub async fn health() -> Json<serde_json::Value> {
 mod tests {
     use super::*;
     use axum::{body::to_bytes, body::Body, http::Request, Router};
-    use base64::{engine::general_purpose::STANDARD, Engine};
     use std::time::Duration;
     use tower::ServiceExt;
 
@@ -193,7 +196,24 @@ mod tests {
     }
 
     fn key() -> String {
-        STANDARD.encode([7u8; 32])
+        shadowvpn_crypto::public_key_b64(&[7u8; 32])
+    }
+
+    fn identity(group_name: &str) -> serde_json::Value {
+        serde_json::to_value(
+            shadowvpn_crypto::create_peer_identity(&[7u8; 32], group_name, &key()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn register_body(group_name: &str, password: &str) -> serde_json::Value {
+        serde_json::json!({
+            "group_name": group_name,
+            "group_password": password,
+            "public_key": key(),
+            "identity": identity(group_name),
+            "hostname": "pc-1"
+        })
     }
 
     fn create_body() -> serde_json::Value {
@@ -227,15 +247,7 @@ mod tests {
     #[tokio::test]
     async fn register_requires_existing_network() {
         let response = app()
-            .oneshot(post(
-                "/register",
-                serde_json::json!({
-                    "group_name": "rede-api",
-                    "group_password": "senha-segura",
-                    "public_key": key(),
-                    "hostname": "pc-1"
-                }),
-            ))
+            .oneshot(post("/register", register_body("rede-api", "senha-segura")))
             .await
             .expect("registro");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -248,21 +260,31 @@ mod tests {
             .route("/register", axum::routing::post(register))
             .with_state(state);
         let response = app
-            .oneshot(post(
-                "/register",
-                serde_json::json!({
-                    "group_name": "rede-api",
-                    "group_password": "senha-segura",
-                    "public_key": key(),
-                    "hostname": "pc-1"
-                }),
-            ))
+            .oneshot(post("/register", register_body("rede-api", "senha-segura")))
             .await
             .expect("registro após criação");
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response).await;
         assert_eq!(body["virtual_ip"], "26.26.26.2");
         assert_eq!(body["relay"], "127.0.0.1:8081");
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_peer_identity() {
+        let state = AppState::new(Duration::from_secs(75), 8081, None);
+        state
+            .create_network("rede-api", "senha-segura")
+            .expect("rede");
+        let app = Router::new()
+            .route("/register", axum::routing::post(register))
+            .with_state(state);
+        let mut body = register_body("rede-api", "senha-segura");
+        body["identity"]["signature"] = serde_json::json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==");
+        let response = app
+            .oneshot(post("/register", body))
+            .await
+            .expect("registro");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

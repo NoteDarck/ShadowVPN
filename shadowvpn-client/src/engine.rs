@@ -8,8 +8,8 @@ use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 use futures::{SinkExt, StreamExt};
 use shadowvpn_core::{
-    encode_relay_packet, parse_relay_packet, valid_public_key, PeerInfo, RegisterResponse,
-    RelayKind, HEARTBEAT_SECS, RELAY_HEADER_LEN, VIRTUAL_NETWORK_PREFIX,
+    encode_relay_packet, parse_relay_packet, valid_public_key, PeerIdentity, PeerInfo,
+    RegisterResponse, RelayKind, HEARTBEAT_SECS, RELAY_HEADER_LEN, VIRTUAL_NETWORK_PREFIX,
 };
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -30,6 +30,7 @@ pub enum ClientEvent {
         virtual_ip: String,
         relay: String,
         public_key: String,
+        identity_fingerprint: String,
         latency_ms: u64,
         peers: Vec<PeerInfo>,
     },
@@ -128,6 +129,10 @@ pub async fn run(
         .unwrap_or_else(identity::default_identity_path)?;
     let secret = identity::load_or_create(&identity_path)?;
     let public_key = identity::public_key_b64(&secret);
+    let identity_proof =
+        shadowvpn_crypto::create_peer_identity(secret.as_bytes(), &config.group_name, &public_key)?;
+    let identity_fingerprint =
+        shadowvpn_crypto::verify_peer_identity(&public_key, &config.group_name, &identity_proof)?;
     let hostname = local_hostname();
 
     let api = Api::new(&config.server)?;
@@ -142,6 +147,7 @@ pub async fn run(
             &config.group_name,
             &config.group_password,
             &public_key,
+            &identity_proof,
             &hostname,
         )
         .await?;
@@ -176,7 +182,7 @@ pub async fn run(
         }
     };
     let mut peers = PeerSet::default();
-    let peer_list = peers.reconcile(&registered.peers, &secret);
+    let peer_list = peers.reconcile(&registered.peers, &secret, &config.group_name);
     if let Err(error) = send_hello(&udp, relay, own_session).await {
         cleanup_registration(&api, &config, own_session).await;
         return Err(error);
@@ -189,6 +195,7 @@ pub async fn run(
             virtual_ip: own_ip.to_string(),
             relay: relay.to_string(),
             public_key: public_key.clone(),
+            identity_fingerprint,
             latency_ms: register_latency_ms,
             peers: peer_list.clone(),
         },
@@ -210,6 +217,7 @@ pub async fn run(
         &api,
         &config,
         &public_key,
+        &identity_proof,
         &hostname,
     )
     .await;
@@ -235,6 +243,7 @@ async fn session_loop(
     api: &Api,
     config: &ClientConfig,
     public_key: &str,
+    identity_proof: &PeerIdentity,
     hostname: &str,
 ) -> Result<()> {
     let mut udp_buffer = vec![0u8; PACKET_BUFFER];
@@ -246,6 +255,7 @@ async fn session_loop(
     let heartbeat_api = api.clone();
     let heartbeat_config = config.clone();
     let heartbeat_public_key = public_key.to_string();
+    let heartbeat_identity = identity_proof.clone();
     let heartbeat_hostname = hostname.to_string();
     let mut heartbeat_tasks = tokio::task::JoinSet::new();
     heartbeat_tasks.spawn(async move {
@@ -260,6 +270,7 @@ async fn session_loop(
                     &heartbeat_config.group_name,
                     &heartbeat_config.group_password,
                     &heartbeat_public_key,
+                    &heartbeat_identity,
                     &heartbeat_hostname,
                 )
                 .await;
@@ -332,7 +343,8 @@ async fn session_loop(
                         if response.session_id != *own_session {
                             *own_session = response.session_id;
                         }
-                        let refreshed = peers.reconcile(&response.peers, secret);
+                        let refreshed =
+                            peers.reconcile(&response.peers, secret, &config.group_name);
                         emit(events, ClientEvent::Peers(refreshed));
                         send_hello(udp, relay, *own_session).await?;
                         tracing::debug!(peers = peers.len(), "heartbeat enviado");
@@ -600,7 +612,12 @@ struct Peer {
 }
 
 impl PeerSet {
-    fn reconcile(&mut self, infos: &[PeerInfo], secret: &StaticSecret) -> Vec<PeerInfo> {
+    fn reconcile(
+        &mut self,
+        infos: &[PeerInfo],
+        secret: &StaticSecret,
+        group_name: &str,
+    ) -> Vec<PeerInfo> {
         let mut seen = HashSet::new();
 
         for info in infos {
@@ -620,6 +637,32 @@ impl PeerSet {
                 }
             }
 
+            let fingerprint = match shadowvpn_crypto::verify_peer_identity(
+                &info.public_key,
+                group_name,
+                &info.identity,
+            ) {
+                Ok(fingerprint) if fingerprint == info.fingerprint => fingerprint,
+                Ok(_) => {
+                    tracing::warn!(peer = %info.public_key, "fingerprint divergente do servidor");
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(peer = %info.public_key, %error, "identidade do peer inválida");
+                    continue;
+                }
+            };
+
+            if self
+                .peers
+                .get(&info.public_key)
+                .map(|peer| peer.info.fingerprint != fingerprint)
+                .unwrap_or(false)
+            {
+                tracing::warn!(peer = %info.public_key, "identidade do peer mudou; recriando túnel");
+                self.remove(&info.public_key);
+            }
+
             if let Some(peer) = self.peers.get_mut(&info.public_key) {
                 self.by_session.remove(&peer.info.session_id);
                 if let Ok(old_ip) = peer.info.virtual_ip.parse::<Ipv4Addr>() {
@@ -630,22 +673,27 @@ impl PeerSet {
                 let Ok(public_key) = decode_public_key(&info.public_key) else {
                     continue;
                 };
-                let index = (self.next_index & 0x00FF_FFFF).max(1);
-                self.next_index = (index + 1) & 0x00FF_FFFF;
-                let tunn = match Tunn::new(
-                    secret.clone(),
-                    public_key,
-                    None,
-                    Some(WIREGUARD_KEEPALIVE_SECS),
-                    index,
-                    None,
+                let psk = match shadowvpn_crypto::derive_pairwise_psk(
+                    secret.as_bytes(),
+                    &info.public_key,
+                    group_name,
                 ) {
-                    Ok(tunn) => tunn,
+                    Ok(psk) => psk,
                     Err(error) => {
-                        tracing::warn!(%error, "não foi possível criar túnel para peer");
+                        tracing::warn!(peer = %info.public_key, %error, "PSK do peer inválido");
                         continue;
                     }
                 };
+                let index = (self.next_index & 0x00FF_FFFF).max(1);
+                self.next_index = (index + 1) & 0x00FF_FFFF;
+                let tunn = Tunn::new(
+                    secret.clone(),
+                    public_key,
+                    Some(psk),
+                    Some(WIREGUARD_KEEPALIVE_SECS),
+                    index,
+                    None,
+                );
                 self.peers.insert(
                     info.public_key.clone(),
                     Peer {
@@ -729,21 +777,39 @@ fn decode_public_key(encoded: &str) -> Result<PublicKey> {
 mod tests {
     use super::*;
 
+    const TEST_GROUP: &str = "rede-teste";
+
+    fn peer_info(
+        secret: &StaticSecret,
+        session_id: u64,
+        virtual_ip: &str,
+        hostname: &str,
+    ) -> PeerInfo {
+        let public_key = BASE64.encode(PublicKey::from(secret).as_bytes());
+        let identity =
+            shadowvpn_crypto::create_peer_identity(secret.as_bytes(), TEST_GROUP, &public_key)
+                .unwrap();
+        let fingerprint =
+            shadowvpn_crypto::verify_peer_identity(&public_key, TEST_GROUP, &identity).unwrap();
+        PeerInfo {
+            public_key,
+            identity,
+            fingerprint,
+            session_id,
+            virtual_ip: virtual_ip.into(),
+            hostname: hostname.into(),
+        }
+    }
+
     #[test]
     fn peer_set_reconciles_and_removes_peers() {
         let secret = StaticSecret::random_from_rng(rand_core::OsRng);
-        let public = PublicKey::from(&secret);
-        let peer_key = BASE64.encode(public.as_bytes());
+        let peer_secret = StaticSecret::random_from_rng(rand_core::OsRng);
+        let info = peer_info(&peer_secret, 7, "26.26.26.9", "pc-teste");
+        let peer_key = info.public_key.clone();
 
         let mut peers = PeerSet::default();
-        let infos = vec![PeerInfo {
-            public_key: peer_key.clone(),
-            session_id: 7,
-            virtual_ip: "26.26.26.9".into(),
-            hostname: "pc-teste".into(),
-        }];
-
-        let listed = peers.reconcile(&infos, &secret);
+        let listed = peers.reconcile(&[info], &secret, TEST_GROUP);
         assert_eq!(listed.len(), 1);
         assert_eq!(peers.by_session.get(&7), Some(&peer_key));
         assert_eq!(
@@ -751,10 +817,22 @@ mod tests {
             Some(&peer_key)
         );
 
-        let listed = peers.reconcile(&[], &secret);
+        let listed = peers.reconcile(&[], &secret, TEST_GROUP);
         assert!(listed.is_empty());
         assert!(peers.by_session.is_empty());
         assert!(peers.by_ip.is_empty());
+    }
+
+    #[test]
+    fn peer_set_rejects_invalid_identity() {
+        let secret = StaticSecret::random_from_rng(rand_core::OsRng);
+        let peer_secret = StaticSecret::random_from_rng(rand_core::OsRng);
+        let mut info = peer_info(&peer_secret, 7, "26.26.26.9", "pc-teste");
+        info.identity.signature = BASE64.encode([0u8; 64]);
+
+        let mut peers = PeerSet::default();
+        assert!(peers.reconcile(&[info], &secret, TEST_GROUP).is_empty());
+        assert!(peers.peers.is_empty());
     }
 
     #[test]
@@ -765,29 +843,16 @@ mod tests {
     #[test]
     fn wireguard_peer_handshake_and_data() {
         let secret_a = StaticSecret::random_from_rng(rand_core::OsRng);
-        let public_a = PublicKey::from(&secret_a);
         let secret_b = StaticSecret::random_from_rng(rand_core::OsRng);
-        let public_b = PublicKey::from(&secret_b);
-        let key_a = BASE64.encode(public_a.as_bytes());
-        let key_b = BASE64.encode(public_b.as_bytes());
-
-        let info_a = PeerInfo {
-            public_key: key_a.clone(),
-            session_id: 11,
-            virtual_ip: "26.26.26.2".into(),
-            hostname: "pc-a".into(),
-        };
-        let info_b = PeerInfo {
-            public_key: key_b.clone(),
-            session_id: 22,
-            virtual_ip: "26.26.26.3".into(),
-            hostname: "pc-b".into(),
-        };
+        let info_a = peer_info(&secret_a, 11, "26.26.26.2", "pc-a");
+        let info_b = peer_info(&secret_b, 22, "26.26.26.3", "pc-b");
+        let key_a = info_a.public_key.clone();
+        let key_b = info_b.public_key.clone();
 
         let mut peers_a = PeerSet::default();
-        peers_a.reconcile(&[info_b], &secret_a);
+        peers_a.reconcile(&[info_b], &secret_a, TEST_GROUP);
         let mut peers_b = PeerSet::default();
-        peers_b.reconcile(&[info_a], &secret_b);
+        peers_b.reconcile(&[info_a], &secret_b, TEST_GROUP);
 
         let packet = ipv4_udp_packet();
         let relay = IpAddr::V4(Ipv4Addr::LOCALHOST);

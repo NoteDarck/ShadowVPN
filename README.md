@@ -4,22 +4,24 @@
 
 # ShadowVPN
 
-ShadowVPN é uma VPN de grupo inspirada no Radmin VPN, escrita em Rust. Cada computador recebe um IP virtual e pode acessar os outros membros do mesmo grupo. O tráfego entre os computadores é cifrado com WireGuard (BoringTun), e um servidor de relay encaminha os datagramas para que a VPN funcione atrás de NAT, sem abrir portas em cada cliente.
+ShadowVPN é uma VPN de grupo inspirada no Radmin VPN, escrita em Rust. Cada computador recebe um IP virtual e pode acessar os outros membros do mesmo grupo. O tráfego entre os computadores é cifrado com WireGuard (BoringTun), a chave de cada peer é autenticada com XEdDSA (o algoritmo de identidade do Signal) e um PSK pairwise é derivado das identidades X25519. O servidor de relay encaminha os datagramas para que a VPN funcione atrás de NAT, sem abrir portas em cada cliente.
 
 > Status: MVP funcional, mas **não auditado**. Use em laboratório, escritório ou comunidade de confiança. Leia a seção [Segurança](#segurança) antes de expor o servidor na internet.
 
 ## Recursos
 
+- Convites `shadowvpn://` que embutem servidor e rede; a senha nunca vai no link.
 - Criação explícita de redes, persistidas no servidor, com senha compartilhada.
 - IP virtual estável por identidade enquanto a sessão estiver ativa.
 - Criptografia ponta a ponta WireGuard entre os peers.
+- Identidade XEdDSA verificada pelo servidor e pelos peers, com fingerprint SHA-256.
+- PSK pairwise derivado por X25519/HKDF e aplicado ao WireGuard de cada par.
 - Relay UDP no servidor, sem necessidade de port forwarding nos clientes.
 - Cliente CLI e GUI desktop (egui/eframe) com visual escuro inspirado em VPNs de grupo, painel de rede, lista de computadores e status em tempo real.
 - Windows, Linux (x86_64 e aarch64) e macOS (Intel e Apple Silicon).
-- Identidade WireGuard persistente e reutilizada entre conexões.
 - Redes sobrevivem a reinícios do servidor; sessões e peers continuam em memória.
 - Heartbeat, expiração de sessões e limpeza automática de peers inativos.
-- Nomes dos computadores e latência do servidor exibidos na GUI.
+- Nomes dos computadores, fingerprints e latência do servidor exibidos na GUI.
 - Releases automatizados com AppImage, instalador Windows, checksums e `wintun.dll` no pacote Windows.
 
 ## Como funciona
@@ -45,11 +47,13 @@ ShadowVPN é uma VPN de grupo inspirada no Radmin VPN, escrita em Rust. Cada com
 ```
 
 1. Uma pessoa cria a rede com `POST /networks`, informando nome e senha. O servidor guarda o hash Argon2 no arquivo de redes.
-2. Cada cliente gera uma chave WireGuard e faz `POST /register` com grupo, senha, chave pública e hostname. A rede precisa existir.
-3. O servidor valida a senha, aloca um IP virtual e devolve a lista de peers e o endereço do relay.
-4. O cliente cria a interface TUN e envia um `HELLO` UDP ao relay para registrar seu endereço público.
-5. Cada peer mantém uma sessão WireGuard com os demais. O relay encaminha os datagramas pelo `session_id` de destino.
+2. Cada cliente gera uma chave WireGuard persistente, assina uma prova XEdDSA ligada à rede e à chave pública e faz `POST /register` com grupo, senha, chave, prova e hostname.
+3. O servidor valida a senha e a prova XEdDSA, aloca um IP virtual e devolve a lista de peers (cada um com sua prova e fingerprint) e o endereço do relay.
+4. O cliente verifica a prova de cada peer, calcula um PSK pairwise com X25519/HKDF e cria a interface TUN; em seguida envia um `HELLO` UDP ao relay.
+5. Cada peer mantém uma sessão WireGuard com os demais usando o PSK do par. O relay encaminha os datagramas pelo `session_id` de destino.
 6. A cada 20 segundos o cliente reenvia o registro (idempotente) para renovar a sessão e atualizar a lista de peers.
+
+O convite reúne o endereço do coordenador e o nome da rede. Ele não inclui a senha, não substitui o servidor e não é um serviço central: alguém ainda precisa hospedar o `shadowvpn-server`.
 
 O túnel cobre apenas a rede virtual `26.26.26.0/24`. Ele **não** roteia todo o tráfego da internet por padrão.
 
@@ -94,7 +98,7 @@ SHADOWVPN_PASSWORD='uma-senha-forte' \
 cargo run --release -p shadowvpn-client -- --create
 ```
 
-`--create` cria a rede e já conecta este computador. Se a rede já existir, o servidor responde `409 Conflict`; nesse caso entre sem `--create`.
+`--create` cria a rede e já conecta este computador. Ao criar, o log imprime um link `shadowvpn://` com servidor e rede. Se a rede já existir, o servidor responde `409 Conflict`; nesse caso entre sem `--create`.
 
 Também é possível criar apenas a rede via API:
 
@@ -108,16 +112,15 @@ Guarde o arquivo `data/networks.json` do servidor: ele contém os hashes das sen
 
 ### 3. Entrar na rede
 
-Em outro computador, com a mesma versão, preencha servidor, rede e senha e use **Entrar em rede** na GUI, ou execute:
+Em outro computador, com a mesma versão, cole o convite, informe a senha e use **Entrar em rede** na GUI, ou execute:
 
 ```bash
-SHADOWVPN_SERVER=http://vpn.exemplo.com:8080 \
-SHADOWVPN_GROUP=minha-rede \
 SHADOWVPN_PASSWORD='uma-senha-forte' \
-cargo run --release -p shadowvpn-client
+cargo run --release -p shadowvpn-client -- \
+  --invite 'shadowvpn://join?server=http%3A%2F%2Fvpn.exemplo.com%3A8080&network=minha-rede'
 ```
 
-O cliente imprime o IP virtual e o relay nos logs. Use `SHADOWVPN_LOG=debug` para mais detalhes.
+Também é possível informar `--server` e `--group` manualmente, sem convite. O cliente imprime o IP virtual e o relay nos logs. Use `SHADOWVPN_LOG=debug` para mais detalhes.
 
 Para parar, pressione `Ctrl+C`. O cliente remove o peer do grupo e encerra a interface. A rede permanece cadastrada no servidor.
 
@@ -129,10 +132,10 @@ cargo run --release -p shadowvpn-gui
 
 A GUI oferece dois modos:
 
-- **Criar rede**: define nome e senha, cria a rede no servidor e depois permite entrar.
-- **Entrar em rede**: conecta a uma rede já criada.
+- **Criar rede**: define nome e senha, cria a rede no servidor e depois permite copiar o convite.
+- **Entrar em rede**: recebe um link de convite e a senha da rede.
 
-Depois de conectar, a GUI mostra o IP virtual, o relay, sua chave pública e os peers conectados.
+O servidor de coordenação fica na seção **Servidor avançado**; no fluxo normal ele é preenchido pelo convite. Depois de conectar, a GUI mostra o IP virtual, o relay, sua chave pública, seu fingerprint e os peers conectados.
 
 A criação da rede não exige privilégios especiais; a conexão TUN sim. A GUI não eleva privilégios automaticamente. No Windows, abra como Administrador; no Linux/macOS, inicie pelo terminal com as permissões necessárias.
 
@@ -144,8 +147,9 @@ Flags da CLI (as variáveis de ambiente equivalentes estão entre parênteses):
 
 | Flag | Variável | Padrão |
 |---|---|---|
-| `--server` | `SHADOWVPN_SERVER` | `http://127.0.0.1:8080` |
-| `--group` | `SHADOWVPN_GROUP` | `minha-rede` |
+| `--invite` | `SHADOWVPN_INVITE` | — |
+| `--server` | `SHADOWVPN_SERVER` | `http://127.0.0.1:8080` se não houver convite |
+| `--group` | `SHADOWVPN_GROUP` | `minha-rede` se não houver convite |
 | `--password` | `SHADOWVPN_PASSWORD` | obrigatória |
 | `--identity` | `SHADOWVPN_IDENTITY` | caminho padrão do sistema |
 | `--create` | `SHADOWVPN_CREATE` | `false` |
@@ -153,11 +157,11 @@ Flags da CLI (as variáveis de ambiente equivalentes estão entre parênteses):
 
 Prefira `SHADOWVPN_PASSWORD` em vez de `--password`: argumentos de linha de comando podem aparecer no histórico e na lista de processos.
 
-O nome do grupo deve ter até 64 caracteres alfanuméricos, `-` ou `_`. A senha deve ter entre 8 e 128 caracteres.
+O nome do grupo deve ter até 64 caracteres alfanuméricos, `-` ou `_`. A senha deve ter entre 8 e 128 caracteres. O convite tem precedência sobre `--server` e `--group`.
 
 `--create` cria a rede antes de entrar e falha se ela já existir. Use apenas na primeira conexão. Se a criação da rede funcionar mas o TUN falhar por falta de privilégio, a rede permanece criada; corrija a permissão e entre sem `--create`.
 
-A identidade é criada automaticamente e nunca deve ser copiada entre computadores:
+A identidade XEdDSA é derivada da mesma chave WireGuard persistente, criada automaticamente, e nunca deve ser copiada entre computadores. O fingerprint exibido na GUI é um hash SHA-256 dessa chave; compare-o fora de banda se quiser detectar troca de peer:
 
 - Linux: `$XDG_CONFIG_HOME/shadowvpn/identity.key` ou `~/.config/shadowvpn/identity.key`
 - macOS: `~/Library/Application Support/shadowvpn/identity.key`
@@ -190,11 +194,11 @@ Para IPv6, use colchetes: `SHADOWVPN_RELAY_ADVERTISE=[2001:db8::10]:8081`.
 |---|---|---|
 | `GET` | `/health` | Saúde do servidor |
 | `POST` | `/networks` | Criar uma rede (nome e senha) |
-| `POST` | `/register` | Entrar em uma rede existente e obter IP, sessão e peers |
+| `POST` | `/register` | Entrar em uma rede existente, provar posse da chave WireGuard e obter IP, sessão e peers |
 | `POST` | `/peers` | Heartbeat alternativo e lista atualizada de peers |
 | `POST` | `/unregister` | Sair do grupo |
 
-As redes são persistidas em `data/networks.json` (configurável por `SHADOWVPN_NETWORKS_FILE`) e sobrevivem a reinícios. Peers e sessões ficam em memória e são perdidos no reinício; os clientes renovam o registro no próximo heartbeat, mas podem precisar reconectar se o IP virtual mudar. O arquivo contém apenas hashes Argon2 e recebe permissão `0600` no Unix.
+As redes são persistidas em `data/networks.json` (configurável por `SHADOWVPN_NETWORKS_FILE`) e sobrevivem a reinícios. Peers e sessões ficam em memória e são perdidos no reinício; os clientes renovam o registro no próximo heartbeat, mas podem precisar reconectar se o IP virtual mudar. O arquivo contém apenas hashes Argon2 e recebe permissão `0600` no Unix. O `POST /register` exige o objeto `identity` com a assinatura XEdDSA da chave pública e da rede.
 
 ## Portas, firewall e HTTPS
 
@@ -210,7 +214,7 @@ vpn.exemplo.com {
 }
 ```
 
-Nesse caso, mantenha `SHADOWVPN_LISTEN=127.0.0.1:8080` e configure `SHADOWVPN_RELAY_ADVERTISE=vpn.exemplo.com:8081`. Sem HTTPS, a senha do grupo e as chaves públicas trafegam em texto claro.
+Nesse caso, mantenha `SHADOWVPN_LISTEN=127.0.0.1:8080` e configure `SHADOWVPN_RELAY_ADVERTISE=vpn.exemplo.com:8081`. Sem HTTPS, a senha do grupo, as chaves públicas e as provas de identidade trafegam em texto claro. O link de convite contém apenas servidor e rede; nunca inclua a senha nele.
 
 ## Permissões por sistema
 
@@ -238,8 +242,8 @@ Use um `SHADOWVPN_IDENTITY` explícito se quiser que a chave criada pelo process
 O AppImage não carrega capabilities. Para usar a GUI empacotada, execute com `sudo`:
 
 ```bash
-chmod +x ShadowVPN-v0.3.0-linux-x86_64.AppImage
-sudo -E ./ShadowVPN-v0.3.0-linux-x86_64.AppImage
+chmod +x ShadowVPN-v0.4.0-linux-x86_64.AppImage
+sudo -E ./ShadowVPN-v0.4.0-linux-x86_64.AppImage
 ```
 
 Alternativamente, extraia o AppImage com `--appimage-extract` e aplique `CAP_NET_ADMIN` ao binário interno.
@@ -262,7 +266,7 @@ sudo ./shadowvpn-client
 Se o arquivo foi baixado pelo navegador e o Gatekeeper bloquear:
 
 ```bash
-xattr -dr com.apple.quarantine ShadowVPN-v0.3.0-macos-aarch64
+xattr -dr com.apple.quarantine ShadowVPN-v0.4.0-macos-aarch64
 ```
 
 Os binários não são assinados nem notarizados.
@@ -288,8 +292,8 @@ O instalador Windows foi compilado com Inno Setup e registra `shadowvpn-gui.exe`
 Para criar uma release:
 
 ```bash
-git tag v0.3.0
-git push origin v0.3.0
+git tag v0.4.0
+git push origin v0.4.0
 ```
 
 Também é possível executar o workflow manualmente em **Actions → Release multiplataforma → Run workflow**, informando uma tag que já exista no remoto.
@@ -308,6 +312,10 @@ Binários gerados em `target/release/`: `shadowvpn-server`, `shadowvpn-client` e
 ## Segurança
 
 - Os pacotes entre peers são cifrados e autenticados pelo WireGuard. O relay encaminha somente ciphertext, mas vê metadados como IPs públicos, sessões e volume de tráfego.
+- Cada peer assina com XEdDSA uma mensagem que inclui a rede e sua chave pública WireGuard. O servidor só aceita o registro se a prova conferir, e cada cliente verifica a prova recebida dos outros peers.
+- O PSK do WireGuard é derivado por X25519 entre as chaves estáticas dos dois peers e HKDF-SHA256 com contexto da rede e das duas chaves. O servidor não participa desse cálculo e não consegue derivar o PSK.
+- XEdDSA é o algoritmo de identidade usado pelo Signal, mas o ShadowVPN **não implementa X3DH nem Double Ratchet**. A confidencialidade do transporte continua sendo a do WireGuard; o PSK pairwise é estático e não acrescenta ratcheting ou recuperação pós-comprometimento.
+- O fingerprint exibido na GUI é `SHA-256(chave pública WireGuard)` em base64. Compare-o com o outro computador por um canal separado se quiser detectar um coordenador mal-intencionado que tente substituir peers por chaves próprias.
 - A API de coordenação usa HTTP simples. Em qualquer rede não confiável, coloque-a atrás de HTTPS. A senha do grupo é enviada a cada requisição.
 - O servidor armazena apenas o hash Argon2 da senha do grupo. A senha em texto claro existe somente durante a requisição.
 - Os `session_id` são compartilhados com os peers do grupo para permitir o roteamento. Um membro mal-intencionado do grupo pode tentar interferir no relay; o WireGuard ainda impede a leitura ou falsificação dos pacotes, mas indisponibilidade e metadados não são protegidos.
@@ -318,12 +326,14 @@ Binários gerados em `target/release/`: `shadowvpn-server`, `shadowvpn-client` e
 ## Limitações
 
 - **Somente relay**: todo o tráfego passa pelo servidor; não há conexão direta P2P/STUN/TURN. A largura de banda do servidor limita a VPN.
+- **Coordenação centralizada**: o convite facilita a entrada e esconde o endereço na interface, mas ainda é preciso hospedar um `shadowvpn-server`. Não há serviço público padrão.
+- **Sem Double Ratchet**: a camada de identidade usa XEdDSA e um PSK estático; não é o protocolo Signal completo do WhatsApp.
 - **IPv4 apenas**: rede virtual `/24`, máximo de 253 peers por grupo.
 - **Sem multicast**: broadcast IPv4 é replicado para os peers, mas multicast não é suportado.
 - **Sem DNS próprio**: acesse os peers pelo IP virtual; os nomes são apenas exibidos na GUI.
 - **Sessões em memória**: redes e hashes de senha são persistidos, mas peers e sessões são perdidos ao reiniciar o servidor.
 - **Sem NAT traversal para o servidor**: o relay UDP precisa ser alcançável na porta publicada.
-- **Sem convite por link**: compartilhe nome e senha da rede por um canal seguro.
+- **Convite sem senha**: o link contém servidor e rede, mas a senha deve ser enviada por outro canal.
 - **Instalação limitada**: há instalador para Windows e AppImage para Linux; macOS continua apenas com binários portáveis. Não há serviço nem inicialização automática.
 - **Sem assinatura de código**: Windows SmartScreen, o instalador e o macOS Gatekeeper podem avisar.
 - **Sem túnel de internet completa**: apenas a sub-rede virtual é roteada.
@@ -351,10 +361,17 @@ Binários gerados em `target/release/`: `shadowvpn-server`, `shadowvpn-client` e
 - Confirme que o dispositivo existe: `ls -l /dev/net/tun`.
 - Use `sudo` ou `setcap cap_net_admin+ep` no binário.
 
+## Atualizando de 0.3.x para 0.4.x
+
+O protocolo de registro mudou: o servidor 0.4.x exige a prova XEdDSA e os peers exigem o PSK pairwise. Atualize servidor, clientes e GUI juntos. Clientes 0.3.x não conseguem entrar em redes 0.4.x e vice-versa.
+
+A chave `identity.key` existente continua válida; a identidade XEdDSA é derivada dela. O fingerprint passa a aparecer na GUI e não requer recriar redes nem senhas.
+
 ## Estrutura
 
 ```text
-shadowvpn-core/    DTOs, protocolo do relay, constantes e validações
+shadowvpn-core/    DTOs, convites, protocolo do relay, constantes e validações
+shadowvpn-crypto/  XEdDSA, fingerprints e derivação do PSK pairwise
 shadowvpn-server/  API HTTP, redes persistentes, sessões e relay UDP
 shadowvpn-client/  API, identidade, TUN, WireGuard e motor do cliente
 shadowvpn-gui/     Interface desktop egui/eframe
@@ -363,4 +380,4 @@ assets/            Ícone e identidade visual do ShadowVPN
 .github/           CI e release multiplataforma
 ```
 
-ShadowVPN não é afiliado ao Radmin VPN. WireGuard e BoringTun pertencem aos seus respectivos autores. A DLL da Wintun é distribuída sob a licença incluída no pacote Windows.
+ShadowVPN não é afiliado ao Radmin VPN nem ao Signal. WireGuard e BoringTun pertencem aos seus respectivos autores. A DLL da Wintun é distribuída sob a licença incluída no pacote Windows.

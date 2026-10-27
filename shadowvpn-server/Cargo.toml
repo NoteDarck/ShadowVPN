@@ -1,10 +1,11 @@
 [package]
 name = "shadowvpn-server"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 
 [dependencies]
 shadowvpn-core = { path = "../shadowvpn-core" }
+shadowvpn-crypto = { path = "../shadowvpn-crypto" }
 anyhow = "1"
 argon2 = "0.5"
 axum = "0.7"

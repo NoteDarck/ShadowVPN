@@ -12,13 +12,16 @@ use argon2::{
 };
 use rand_core::{OsRng as SessionOsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use shadowvpn_core::{clean_hostname, valid_group_name, PeerInfo, VIRTUAL_NETWORK_PREFIX};
+use shadowvpn_core::{
+    clean_hostname, valid_group_name, PeerIdentity, PeerInfo, VIRTUAL_NETWORK_PREFIX,
+};
 
 const NETWORKS_FILE_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateError {
     InvalidCredentials,
+    InvalidIdentity,
     NetworkNotFound,
     NetworkExists,
     GroupFull,
@@ -71,6 +74,8 @@ struct Group {
 
 struct Peer {
     public_key: String,
+    identity: PeerIdentity,
+    fingerprint: String,
     hostname: String,
     virtual_ip: Ipv4Addr,
     session_id: u64,
@@ -161,8 +166,11 @@ impl AppState {
         group_name: &str,
         password: &str,
         public_key: &str,
+        identity: &PeerIdentity,
         hostname: &str,
     ) -> Result<RegisterOutcome, StateError> {
+        let fingerprint = shadowvpn_crypto::verify_peer_identity(public_key, group_name, identity)
+            .map_err(|_| StateError::InvalidIdentity)?;
         let now = Instant::now();
         let mut inner = self.lock();
         inner.prune(now, self.peer_ttl);
@@ -186,6 +194,8 @@ impl AppState {
             if let Some(peer) = group.peers.get_mut(public_key) {
                 peer.last_seen = now;
                 peer.hostname = hostname;
+                peer.identity = identity.clone();
+                peer.fingerprint = fingerprint.clone();
             }
             sessions.entry(session_id).or_insert_with(|| SessionRef {
                 group: group_name.to_owned(),
@@ -199,6 +209,8 @@ impl AppState {
                 public_key.to_owned(),
                 Peer {
                     public_key: public_key.to_owned(),
+                    identity: identity.clone(),
+                    fingerprint,
                     hostname,
                     virtual_ip,
                     session_id,
@@ -407,6 +419,8 @@ fn new_session_id(sessions: &HashMap<u64, SessionRef>) -> u64 {
 fn peer_info(peer: &Peer) -> PeerInfo {
     PeerInfo {
         public_key: peer.public_key.clone(),
+        identity: peer.identity.clone(),
+        fingerprint: peer.fingerprint.clone(),
         session_id: peer.session_id,
         virtual_ip: peer.virtual_ip.to_string(),
         hostname: peer.hostname.clone(),
@@ -567,27 +581,34 @@ mod tests {
     }
 
     fn key(n: u8) -> String {
-        use base64::{engine::general_purpose::STANDARD, Engine};
-        STANDARD.encode([n; 32])
+        shadowvpn_crypto::public_key_b64(&[n; 32])
+    }
+
+    fn peer_identity(n: u8, group: &str) -> PeerIdentity {
+        shadowvpn_crypto::create_peer_identity(&[n; 32], group, &key(n)).unwrap()
+    }
+
+    fn register(
+        state: &AppState,
+        group: &str,
+        password: &str,
+        n: u8,
+        hostname: &str,
+    ) -> Result<RegisterOutcome, StateError> {
+        state.register(group, password, &key(n), &peer_identity(n, group), hostname)
     }
 
     #[test]
     fn allocates_ips_and_deduplicates_public_keys() {
         let state = state();
-        let first = state
-            .register("grupo", "senha-segura", &key(1), "pc-1")
-            .unwrap();
+        let first = register(&state, "grupo", "senha-segura", 1, "pc-1").unwrap();
         assert_eq!(first.virtual_ip, Ipv4Addr::new(26, 26, 26, 2));
 
-        let second = state
-            .register("grupo", "senha-segura", &key(2), "pc-2")
-            .unwrap();
+        let second = register(&state, "grupo", "senha-segura", 2, "pc-2").unwrap();
         assert_eq!(second.virtual_ip, Ipv4Addr::new(26, 26, 26, 3));
         assert_eq!(second.peers.len(), 1);
 
-        let again = state
-            .register("grupo", "senha-segura", &key(2), "pc-2")
-            .unwrap();
+        let again = register(&state, "grupo", "senha-segura", 2, "pc-2").unwrap();
         assert_eq!(again.virtual_ip, second.virtual_ip);
         assert_eq!(again.session_id, second.session_id);
         assert_eq!(again.peers.len(), 1);
@@ -596,11 +617,9 @@ mod tests {
     #[test]
     fn rejects_wrong_password() {
         let state = state();
-        state
-            .register("grupo", "senha-segura", &key(1), "pc-1")
-            .unwrap();
+        register(&state, "grupo", "senha-segura", 1, "pc-1").unwrap();
         assert!(matches!(
-            state.register("grupo", "outra-senha", &key(2), "pc-2"),
+            register(&state, "grupo", "outra-senha", 2, "pc-2"),
             Err(StateError::InvalidCredentials)
         ));
     }
@@ -608,12 +627,8 @@ mod tests {
     #[test]
     fn heartbeat_and_unregister() {
         let state = state();
-        let first = state
-            .register("grupo", "senha-segura", &key(1), "pc-1")
-            .unwrap();
-        let second = state
-            .register("grupo", "senha-segura", &key(2), "pc-2")
-            .unwrap();
+        let first = register(&state, "grupo", "senha-segura", 1, "pc-1").unwrap();
+        let second = register(&state, "grupo", "senha-segura", 2, "pc-2").unwrap();
 
         let peers = state
             .heartbeat("grupo", "senha-segura", first.session_id)
@@ -635,15 +650,9 @@ mod tests {
         let state = state();
         state.create_network("a", "senha-segura").unwrap();
         state.create_network("b", "senha-segura").unwrap();
-        let first = state
-            .register("a", "senha-segura", &key(1), "pc-1")
-            .unwrap();
-        let second = state
-            .register("a", "senha-segura", &key(2), "pc-2")
-            .unwrap();
-        let outsider = state
-            .register("b", "senha-segura", &key(3), "pc-3")
-            .unwrap();
+        let first = register(&state, "a", "senha-segura", 1, "pc-1").unwrap();
+        let second = register(&state, "a", "senha-segura", 2, "pc-2").unwrap();
+        let outsider = register(&state, "b", "senha-segura", 3, "pc-3").unwrap();
 
         let first_addr: SocketAddr = "203.0.113.10:5000".parse().unwrap();
         let second_addr: SocketAddr = "203.0.113.11:5000".parse().unwrap();
@@ -669,9 +678,7 @@ mod tests {
         state
             .create_network("grupo", "senha-segura")
             .expect("rede de teste");
-        let first = state
-            .register("grupo", "senha-segura", &key(1), "pc-1")
-            .unwrap();
+        let first = register(&state, "grupo", "senha-segura", 1, "pc-1").unwrap();
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(state.cleanup(), 1);
         assert!(matches!(
@@ -679,9 +686,7 @@ mod tests {
             Err(StateError::SessionNotFound)
         ));
 
-        let again = state
-            .register("grupo", "senha-segura", &key(2), "pc-2")
-            .unwrap();
+        let again = register(&state, "grupo", "senha-segura", 2, "pc-2").unwrap();
         assert_eq!(again.virtual_ip, Ipv4Addr::new(26, 26, 26, 2));
     }
 
@@ -689,12 +694,10 @@ mod tests {
     fn requires_network_to_exist_before_register() {
         let state = state();
         assert!(matches!(
-            state.register("rede-nova", "senha-segura", &key(1), "pc-1"),
+            register(&state, "rede-nova", "senha-segura", 1, "pc-1"),
             Err(StateError::NetworkNotFound)
         ));
-        assert!(state
-            .register("grupo", "senha-segura", &key(1), "pc-1")
-            .is_ok());
+        assert!(register(&state, "grupo", "senha-segura", 1, "pc-1").is_ok());
         assert!(matches!(
             state.create_network("grupo", "outra-senha"),
             Err(StateError::NetworkExists)
@@ -718,12 +721,11 @@ mod tests {
         drop(state);
         let reloaded = AppState::with_networks_file(Duration::from_secs(75), 8081, None, path)
             .expect("recarregar estado");
-        let peer = reloaded
-            .register("rede-persistente", "senha-segura", &key(1), "pc-1")
+        let peer = register(&reloaded, "rede-persistente", "senha-segura", 1, "pc-1")
             .expect("entrar após reinício");
         assert_eq!(peer.virtual_ip, Ipv4Addr::new(26, 26, 26, 2));
         assert!(matches!(
-            reloaded.register("rede-persistente", "senha-errada", &key(2), "pc-2"),
+            register(&reloaded, "rede-persistente", "senha-errada", 2, "pc-2"),
             Err(StateError::InvalidCredentials)
         ));
     }

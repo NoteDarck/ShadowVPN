@@ -12,6 +12,111 @@ pub const HEARTBEAT_SECS: u64 = 20;
 pub const RELAY_MAGIC: [u8; 4] = *b"SVPN";
 pub const RELAY_VERSION: u8 = 1;
 pub const RELAY_HEADER_LEN: usize = 22;
+pub const INVITE_SCHEME: &str = "shadowvpn";
+
+/// Prova XEdDSA de posse da chave privada WireGuard.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerIdentity {
+    /// Assinatura XEdDSA em base64.
+    pub signature: String,
+}
+
+/// Convite que reúne o servidor de coordenação e o nome da rede.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Invite {
+    pub server: String,
+    pub network: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InviteError {
+    InvalidLink,
+    UnsupportedScheme,
+    MissingServer,
+    MissingNetwork,
+    InvalidServer,
+    InvalidNetwork,
+}
+
+impl std::fmt::Display for InviteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InviteError::InvalidLink => formatter.write_str("o convite não é um link válido"),
+            InviteError::UnsupportedScheme => {
+                formatter.write_str("o convite deve começar com shadowvpn://")
+            }
+            InviteError::MissingServer => formatter.write_str("o convite não inclui o servidor"),
+            InviteError::MissingNetwork => formatter.write_str("o convite não inclui a rede"),
+            InviteError::InvalidServer => formatter.write_str("o servidor do convite é inválido"),
+            InviteError::InvalidNetwork => {
+                formatter.write_str("o nome da rede do convite é inválido")
+            }
+        }
+    }
+}
+
+impl std::error::Error for InviteError {}
+
+impl Invite {
+    pub fn new(server: &str, network: &str) -> Result<Self, InviteError> {
+        let server = normalize_server(server).ok_or(InviteError::InvalidServer)?;
+        let network = network.trim();
+        if !valid_group_name(network) {
+            return Err(InviteError::InvalidNetwork);
+        }
+        Ok(Self {
+            server,
+            network: network.to_owned(),
+        })
+    }
+
+    pub fn parse(value: &str) -> Result<Self, InviteError> {
+        let value = value.trim();
+        let url = url::Url::parse(value).map_err(|_| InviteError::InvalidLink)?;
+        if url.scheme() != INVITE_SCHEME {
+            return Err(InviteError::UnsupportedScheme);
+        }
+
+        let mut server = None;
+        let mut network = None;
+        for (key, value) in url.query_pairs() {
+            match key.as_ref() {
+                "server" => server = Some(value.into_owned()),
+                "network" => network = Some(value.into_owned()),
+                _ => {}
+            }
+        }
+
+        let server = server.ok_or(InviteError::MissingServer)?;
+        let network = network.ok_or(InviteError::MissingNetwork)?;
+        Self::new(&server, &network)
+    }
+
+    pub fn to_url(&self) -> String {
+        let mut url = url::Url::parse("shadowvpn://join").expect("URL de convite fixa");
+        url.query_pairs_mut()
+            .append_pair("server", &self.server)
+            .append_pair("network", &self.network);
+        url.to_string()
+    }
+}
+
+fn normalize_server(value: &str) -> Option<String> {
+    let server = value.trim().trim_end_matches('/');
+    let url = url::Url::parse(server).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    if url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    Some(server.to_owned())
+}
 
 /// Requisição para criar uma rede no servidor.
 #[derive(Clone, Serialize, Deserialize)]
@@ -33,6 +138,8 @@ pub struct RegisterRequest {
     pub group_password: String,
     /// Chave pública WireGuard em base64.
     pub public_key: String,
+    /// Prova de posse da chave privada WireGuard.
+    pub identity: PeerIdentity,
     /// Nome exibido no grupo (hostname do computador).
     #[serde(default)]
     pub hostname: String,
@@ -55,6 +162,8 @@ pub struct RegisterResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerInfo {
     pub public_key: String,
+    pub identity: PeerIdentity,
+    pub fingerprint: String,
     pub session_id: u64,
     pub virtual_ip: String,
     /// Nome exibido no grupo (hostname do computador).
@@ -210,6 +319,34 @@ mod tests {
         assert_eq!(clean_hostname("  notebook\n"), "notebook");
         assert_eq!(clean_hostname("pc \u{1}"), "pc");
         assert_eq!(clean_hostname(""), "");
+    }
+
+    #[test]
+    fn invite_roundtrip_and_validation() {
+        let invite = Invite::new("http://vpn.example.com:8080/", "minha-rede").unwrap();
+        let link = invite.to_url();
+        assert_eq!(Invite::parse(&link).unwrap(), invite);
+
+        assert_eq!(
+            Invite::parse("https://example.com/?server=x&network=y"),
+            Err(InviteError::UnsupportedScheme)
+        );
+        assert_eq!(
+            Invite::parse("shadowvpn://join?network=minha-rede"),
+            Err(InviteError::MissingServer)
+        );
+        assert_eq!(
+            Invite::parse("shadowvpn://join?server=http%3A%2F%2Fexample.com"),
+            Err(InviteError::MissingNetwork)
+        );
+        assert_eq!(
+            Invite::new("ftp://example.com", "minha-rede"),
+            Err(InviteError::InvalidServer)
+        );
+        assert_eq!(
+            Invite::new("http://example.com", "nome inválido"),
+            Err(InviteError::InvalidNetwork)
+        );
     }
 
     #[test]

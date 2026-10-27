@@ -1,8 +1,9 @@
 [package]
 name = "shadowvpn-core"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 base64 = "0.22"
+url = "2"

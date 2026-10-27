@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "shadowvpn-core",
+    "shadowvpn-crypto",
     "shadowvpn-server",
     "shadowvpn-client",
     "shadowvpn-gui",

@@ -4,7 +4,7 @@ use eframe::egui::{
     self, Align, Color32, Frame, Label, Layout, Margin, RichText, Rounding, Sense, Stroke,
 };
 use shadowvpn_client::{ClientConfig, ClientEvent, ClientHandle};
-use shadowvpn_core::PeerInfo;
+use shadowvpn_core::{Invite, PeerInfo};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, TryRecvError};
@@ -57,10 +57,13 @@ struct ShadowVpnApp {
     password: String,
     confirm_password: String,
     identity_path: String,
+    invite_input: String,
+    identity_fingerprint: String,
     entry_mode: EntryMode,
     creating_network: bool,
     create_result: Option<mpsc::Receiver<Result<(), String>>>,
     created_network: Option<String>,
+    invite_applied: bool,
     show_password: bool,
     show_settings: bool,
     styled: bool,
@@ -88,10 +91,13 @@ impl Default for ShadowVpnApp {
             password: String::new(),
             confirm_password: String::new(),
             identity_path: String::new(),
+            invite_input: String::new(),
+            identity_fingerprint: String::new(),
             entry_mode: EntryMode::Join,
             creating_network: false,
             create_result: None,
             created_network: None,
+            invite_applied: false,
             show_password: false,
             show_settings: false,
             styled: false,
@@ -292,16 +298,7 @@ impl ShadowVpnApp {
                 ui.add_space(6.0);
                 let (state_label, state_color) = self.connection_status();
                 sidebar_stat(ui, "Status", state_label, state_color);
-                sidebar_stat(
-                    ui,
-                    "Servidor",
-                    if self.server.trim().is_empty() {
-                        "—"
-                    } else {
-                        self.server.trim()
-                    },
-                    TEXT,
-                );
+                sidebar_stat(ui, "Identidade", "XEdDSA", TEXT);
                 if self.connected {
                     sidebar_stat(
                         ui,
@@ -329,7 +326,7 @@ impl ShadowVpnApp {
                             .color(MUTED),
                     );
                     ui.label(
-                        RichText::new("WireGuard + relay privado")
+                        RichText::new("XEdDSA + WireGuard + relay privado")
                             .size(10.0)
                             .color(MUTED),
                     );
@@ -381,9 +378,9 @@ impl ShadowVpnApp {
         ui.add_space(2.0);
         ui.label(
             RichText::new(if creating {
-                "Escolha um nome e uma senha. A rede fica salva no servidor para os outros entrarem."
+                "Escolha um nome e uma senha. O convite da rede será gerado automaticamente."
             } else {
-                "Use o nome e a senha compartilhados por quem criou a rede."
+                "Cole o convite recebido e informe a senha. O servidor é preenchido sozinho."
             })
             .size(12.5)
             .color(MUTED),
@@ -407,7 +404,13 @@ impl ShadowVpnApp {
             .inner_margin(Margin::same(18.0))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
+                if !creating {
+                    self.invite_fields(ui, busy);
+                    ui.add_space(14.0);
+                }
                 self.connection_fields(ui, busy, creating);
+                ui.add_space(10.0);
+                self.advanced_server(ui, busy);
             });
 
         if self.server != server_before
@@ -415,8 +418,11 @@ impl ShadowVpnApp {
             || self.password != password_before
         {
             self.created_network = None;
-            self.notice = None;
+            if !self.invite_applied {
+                self.notice = None;
+            }
         }
+        self.invite_applied = false;
 
         ui.add_space(14.0);
         let label = if self.creating_network {
@@ -436,12 +442,17 @@ impl ShadowVpnApp {
             }
         }
 
+        if !creating && self.created_network_matches() {
+            ui.add_space(14.0);
+            self.invite_card(ui);
+        }
+
         ui.add_space(16.0);
         if creating {
             ui.label(
                 RichText::new(
-                    "Depois de criar, clique em Entrar na rede. Compartilhe o nome e a senha \
-                     com os outros computadores.",
+                    "Depois de criar, clique em Entrar na rede. Copie o convite e envie a \
+                     senha por um canal separado.",
                 )
                 .size(10.5)
                 .color(MUTED),
@@ -466,8 +477,7 @@ impl ShadowVpnApp {
             ui.add_space(3.0);
             ui.label(
                 RichText::new(
-                    "O tráfego entre peers é cifrado com WireGuard; o servidor de relay não \
-                     consegue ler os pacotes.",
+                    "O link de convite contém apenas servidor e rede. A senha nunca é incluída.",
                 )
                 .size(10.5)
                 .color(MUTED),
@@ -586,6 +596,23 @@ impl ShadowVpnApp {
                     .clicked()
                 {
                     self.disconnect();
+                }
+                if ui
+                    .add_enabled(
+                        !self.stopping,
+                        egui::Button::new(RichText::new("Copiar convite").size(11.5).color(TEXT))
+                            .fill(CARD)
+                            .stroke(Stroke::new(1.0_f32, BORDER))
+                            .rounding(Rounding::same(8.0))
+                            .min_size(egui::vec2(120.0, 34.0)),
+                    )
+                    .clicked()
+                {
+                    if let Some(url) = self.invite_url() {
+                        ui.ctx().copy_text(url);
+                        self.notice =
+                            Some("Convite copiado. Envie o link e a senha separadamente.".into());
+                    }
                 }
             });
         });
@@ -751,8 +778,9 @@ impl ShadowVpnApp {
                                         .truncate(),
                                     )
                                     .on_hover_text(format!(
-                                        "{name}\n{}",
-                                        short_key(&peer.public_key)
+                                        "{name}\nChave: {}\nIdentidade: {}",
+                                        short_key(&peer.public_key),
+                                        peer.fingerprint
                                     ));
                                 });
                                 ui.label(
@@ -823,6 +851,34 @@ impl ShadowVpnApp {
                             );
                             ui.end_row();
 
+                            detail_label(ui, "Fingerprint");
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(if self.identity_fingerprint.is_empty() {
+                                        "—"
+                                    } else {
+                                        &self.identity_fingerprint
+                                    })
+                                    .monospace()
+                                    .size(10.5)
+                                    .color(TEXT),
+                                )
+                                .on_hover_text("Compare este código com o outro computador.");
+                                if !self.identity_fingerprint.is_empty()
+                                    && ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new("copiar").size(9.5).color(MUTED),
+                                            )
+                                            .frame(false),
+                                        )
+                                        .clicked()
+                                {
+                                    ui.ctx().copy_text(self.identity_fingerprint.clone());
+                                }
+                            });
+                            ui.end_row();
+
                             detail_label(ui, "Chave pública");
                             ui.horizontal(|ui| {
                                 ui.label(
@@ -870,25 +926,148 @@ impl ShadowVpnApp {
         );
     }
 
+    fn invite_fields(&mut self, ui: &mut egui::Ui, busy: bool) {
+        field_label(ui, "CONVITE DE REDE");
+        ui.horizontal(|ui| {
+            let response = ui.add_enabled(
+                !busy,
+                egui::TextEdit::singleline(&mut self.invite_input)
+                    .desired_width(ui.available_width() - 84.0)
+                    .hint_text("cole o link shadowvpn://"),
+            );
+            if ui
+                .add_enabled(
+                    !busy && !self.invite_input.trim().is_empty(),
+                    egui::Button::new(RichText::new("Usar").size(11.5).color(TEXT))
+                        .fill(CARD_ALT)
+                        .stroke(Stroke::new(1.0_f32, BORDER))
+                        .rounding(Rounding::same(8.0)),
+                )
+                .clicked()
+                || (response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+            {
+                self.apply_invite();
+            }
+        });
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("O convite não contém a senha; peça a senha separadamente.")
+                .size(10.0)
+                .color(MUTED),
+        );
+    }
+
+    fn server_field(&mut self, ui: &mut egui::Ui, busy: bool) {
+        field_label(ui, "SERVIDOR DE COORDENAÇÃO");
+        ui.add_enabled(
+            !busy,
+            egui::TextEdit::singleline(&mut self.server)
+                .desired_width(f32::INFINITY)
+                .hint_text("http://vpn.exemplo.com:8080"),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("Normalmente preenchido pelo convite. Use apenas ao auto-hospedar.")
+                .size(10.0)
+                .color(MUTED),
+        );
+    }
+
+    fn advanced_server(&mut self, ui: &mut egui::Ui, busy: bool) {
+        egui::CollapsingHeader::new(
+            RichText::new("Servidor avançado")
+                .size(11.0)
+                .strong()
+                .color(MUTED),
+        )
+        .default_open(false)
+        .show(ui, |ui| {
+            self.server_field(ui, busy);
+        });
+    }
+
+    fn invite_card(&mut self, ui: &mut egui::Ui) {
+        let Some(url) = self.invite_url() else {
+            return;
+        };
+        Frame::none()
+            .fill(INPUT)
+            .stroke(Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.3)))
+            .rounding(Rounding::same(10.0))
+            .inner_margin(Margin::symmetric(12.0, 10.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new("CONVITE DESTA REDE")
+                        .size(9.5)
+                        .strong()
+                        .color(ACCENT),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add(
+                        Label::new(RichText::new(&url).monospace().size(10.5).color(TEXT))
+                            .truncate(),
+                    )
+                    .on_hover_text(&url);
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("Copiar").size(10.0).color(ACCENT))
+                                .fill(CARD)
+                                .stroke(Stroke::new(1.0_f32, BORDER))
+                                .rounding(Rounding::same(7.0)),
+                        )
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(url.clone());
+                        self.notice =
+                            Some("Convite copiado. Envie o link e a senha separadamente.".into());
+                    }
+                });
+            });
+    }
+
+    fn invite_url(&self) -> Option<String> {
+        Invite::new(self.server.trim(), self.group.trim())
+            .ok()
+            .map(|invite| invite.to_url())
+    }
+
+    fn apply_invite(&mut self) {
+        let value = self.invite_input.trim().to_string();
+        if value.is_empty() {
+            self.error = Some("Cole um link de convite.".into());
+            return;
+        }
+
+        match Invite::parse(&value) {
+            Ok(invite) => {
+                self.server = invite.server;
+                self.group = invite.network;
+                self.entry_mode = EntryMode::Join;
+                self.invite_input.clear();
+                self.created_network = None;
+                self.invite_applied = true;
+                self.error = None;
+                self.notice = Some("Convite aplicado. Informe a senha da rede.".into());
+                self.status = "Convite carregado".into();
+            }
+            Err(error) => {
+                self.error = Some(error.to_string());
+                self.status = "Convite inválido".into();
+            }
+        }
+    }
+
     fn connection_fields(&mut self, ui: &mut egui::Ui, busy: bool, creating: bool) {
         let enabled = !busy;
-        ui.columns(2, |cols| {
-            field_label(&mut cols[0], "SERVIDOR");
-            cols[0].add_enabled(
-                enabled,
-                egui::TextEdit::singleline(&mut self.server)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("http://vpn.exemplo.com:8080"),
-            );
-
-            field_label(&mut cols[1], "REDE / GRUPO");
-            cols[1].add_enabled(
-                enabled,
-                egui::TextEdit::singleline(&mut self.group)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("minha-rede"),
-            );
-        });
+        field_label(ui, "REDE / GRUPO");
+        ui.add_enabled(
+            enabled,
+            egui::TextEdit::singleline(&mut self.group)
+                .desired_width(f32::INFINITY)
+                .hint_text("minha-rede"),
+        );
 
         ui.add_space(10.0);
         field_label(ui, "SENHA DA REDE");
@@ -959,6 +1138,8 @@ impl ShadowVpnApp {
                         .color(TEXT),
                 );
                 ui.add_space(8.0);
+                self.server_field(ui, busy);
+                ui.add_space(10.0);
                 self.connection_fields(ui, busy, false);
                 if busy {
                     ui.add_space(8.0);
@@ -977,7 +1158,7 @@ impl ShadowVpnApp {
                         .color(MUTED),
                 );
                 ui.label(
-                    RichText::new("WireGuard para cifra • relay UDP próprio")
+                    RichText::new("XEdDSA para identidade • WireGuard para cifra")
                         .size(10.5)
                         .color(MUTED),
                 );
@@ -1184,6 +1365,7 @@ impl ShadowVpnApp {
                     virtual_ip,
                     relay,
                     public_key,
+                    identity_fingerprint,
                     latency_ms,
                     peers,
                 } => {
@@ -1196,6 +1378,7 @@ impl ShadowVpnApp {
                     self.virtual_ip = virtual_ip;
                     self.relay = relay;
                     self.public_key = public_key;
+                    self.identity_fingerprint = identity_fingerprint;
                     self.latency_ms = Some(latency_ms);
                     self.peers = peers;
                     self.status = "Conectado".into();
@@ -1244,6 +1427,7 @@ impl ShadowVpnApp {
     fn clear_session(&mut self) {
         self.hostname.clear();
         self.public_key.clear();
+        self.identity_fingerprint.clear();
         self.virtual_ip.clear();
         self.relay.clear();
         self.latency_ms = None;

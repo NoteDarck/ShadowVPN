@@ -1,12 +1,12 @@
 # Como conectar no ShadowVPN
 
-Este guia cobre o fluxo da versão 0.3.0 em diante: primeiro alguém **cria a rede** no servidor, depois os outros computadores **entram** nela. A rede fica salva mesmo quando todos desconectam ou o servidor reinicia.
+Este guia cobre o fluxo da versão 0.4.0 em diante: primeiro alguém **cria a rede** no servidor, gera um **convite** e os outros computadores entram com o link e a senha. A rede fica salva mesmo quando todos desconectam ou o servidor reinicia.
 
 ## O que você precisa
 
 - Um servidor com o `shadowvpn-server` em execução e as portas TCP `8080` e UDP `8081` liberadas.
 - A mesma versão do ShadowVPN em todos os computadores.
-- Nome e senha da rede compartilhados por um canal seguro.
+- Convite `shadowvpn://` e senha da rede compartilhados por canais seguros. O convite não inclui a senha.
 - Privilégios de administrador nos clientes para criar a interface TUN:
   - Windows: executar como Administrador, com `wintun.dll` ao lado do executável.
   - Linux: `root`, `sudo` ou `CAP_NET_ADMIN` no binário.
@@ -19,8 +19,8 @@ Criar a rede **não** exige privilégios especiais. Entrar/conectar exige.
 | Etapa | Quem faz | Ação |
 |---|---|---|
 | 1 | Administrador do servidor | Inicia `shadowvpn-server` |
-| 2 | Uma pessoa | Cria a rede com nome e senha |
-| 3 | Todos | Entram na mesma rede |
+| 2 | Uma pessoa | Cria a rede com nome e senha e copia o convite |
+| 3 | Todos | Colam o convite, informam a senha e entram |
 | 4 | Todos | Testam o ping pelo IP virtual |
 
 ## 1. Iniciar o servidor
@@ -104,10 +104,10 @@ A rede precisa existir antes do primeiro `register`. Escolha uma das opções ab
 ### Pela GUI
 
 1. Abra o `shadowvpn-gui` como Administrador no Windows ou com privilégios no Linux/macOS.
-2. Preencha o servidor, por exemplo `http://vpn.exemplo.com:8080`.
-3. Na aba **Criar rede**, informe o nome e a senha.
-4. Confirme a senha e clique em **Criar rede**.
-5. Quando aparecer a confirmação, clique em **Entrar na rede**.
+2. Na aba **Criar rede**, informe o nome e a senha.
+3. Confirme a senha e clique em **Criar rede**. O servidor fica em **Servidor avançado** e só precisa ser informado ao auto-hospedar.
+4. Quando aparecer a confirmação, use o cartão do convite e clique em copiar.
+5. Clique em **Entrar na rede** e envie o convite e a senha por canais separados.
 
 A GUI mantém a rede criada durante a sessão e já muda para o modo de entrada.
 
@@ -122,7 +122,22 @@ SHADOWVPN_PASSWORD='uma-senha-forte' \
 ./shadowvpn-client --create
 ```
 
-`--create` cria a rede e em seguida conecta este computador. Se a rede já existir, a criação falha com `409 Conflict`; nesse caso use o fluxo de entrada, sem `--create`. Se a rede for criada mas a interface TUN falhar por falta de privilégio, a rede continua salva no servidor; corrija a permissão e entre sem `--create`.
+`--create` cria a rede e em seguida conecta este computador. O log mostra o convite gerado. Se a rede já existir, a criação falha com `409 Conflict`; nesse caso use o fluxo de entrada, sem `--create`. Se a rede for criada mas a interface TUN falhar por falta de privilégio, a rede continua salva no servidor; corrija a permissão e entre sem `--create`.
+
+### Convite
+
+O convite tem este formato:
+
+```text
+shadowvpn://join?server=http%3A%2F%2Fvpn.exemplo.com%3A8080&network=minha-rede
+```
+
+- `server` é a URL da API de coordenação.
+- `network` é o nome da rede.
+- A senha **não** é incluída. Envie-a por outro canal.
+- O link não cria um serviço central: alguém continua responsável por hospedar o servidor.
+
+Na GUI, o convite aparece após a criação e também pode ser copiado na tela da rede. Na CLI, ele aparece no log do `--create`. A API `POST /networks` não retorna o convite; monte o link com a URL do servidor e o nome da rede.
 
 ### Pela API HTTP
 
@@ -158,14 +173,22 @@ Em cada outro computador:
 ### Pela GUI
 
 1. Abra a GUI como Administrador/root ou com `CAP_NET_ADMIN`.
-2. Informe o mesmo servidor.
-3. Na aba **Entrar em rede**, informe nome e senha.
+2. Na aba **Entrar em rede**, cole o convite e clique em **Usar**.
+3. Informe a senha da rede.
 4. Clique em **Entrar na rede**.
-5. Confira o IP virtual, o relay e os peers na tela de rede.
+5. Confira o IP virtual, o relay, o fingerprint e os peers na tela de rede.
 
-A identidade WireGuard é criada automaticamente e fica salva no computador. Não copie a chave entre máquinas.
+A identidade XEdDSA é derivada da chave WireGuard, criada automaticamente e salva no computador. Não copie a chave entre máquinas. O fingerprint é um hash SHA-256; compare-o fora de banda se quiser confirmar a identidade de um peer.
 
 ### Pela CLI
+
+```bash
+SHADOWVPN_PASSWORD='uma-senha-forte' \
+./shadowvpn-client \
+  --invite 'shadowvpn://join?server=http%3A%2F%2Fvpn.exemplo.com%3A8080&network=minha-rede'
+```
+
+Também é possível informar `--server` e `--group` manualmente:
 
 ```bash
 SHADOWVPN_SERVER=http://vpn.exemplo.com:8080 \
@@ -236,11 +259,18 @@ vpn.exemplo.com {
 
 Mantenha `SHADOWVPN_LISTEN=127.0.0.1:8080` e configure `SHADOWVPN_RELAY_ADVERTISE=vpn.exemplo.com:8081`.
 
-O relay UDP transporta somente datagramas WireGuard cifrados. O servidor vê metadados (IPs públicos, sessões e volume), mas não o conteúdo dos pacotes.
+O relay UDP transporta somente datagramas WireGuard cifrados. O servidor vê metadados (IPs públicos, sessões e volume), mas não o conteúdo dos pacotes. O registro inclui uma prova XEdDSA de posse da chave WireGuard; servidor e peers verificam essa prova antes de criar os túneis. O PSK pairwise é derivado pelas duas pontas e não é conhecido pelo servidor.
 
 Qualquer pessoa que alcance `POST /networks` pode criar uma rede nova. Use nomes difíceis de adivinhar e restrinja o acesso à API em ambientes públicos.
 
 ## Problemas comuns
+
+### "convite inválido"
+
+- Confirme que o link começa com `shadowvpn://`.
+- O convite precisa incluir `server` e `network`.
+- Se você editou o link, codifique a URL do servidor corretamente, por exemplo `http%3A%2F%2Fvpn.exemplo.com%3A8080`.
+- O link não contém a senha; informe-a no campo separado.
 
 ### "rede não encontrada; crie a rede primeiro"
 
@@ -248,7 +278,7 @@ A rede ainda não existe no servidor. Crie-a na GUI/CLI com `--create`/`POST /ne
 
 ### "já existe uma rede com esse nome"
 
-A rede já foi criada. Não use `--create`; entre normalmente com o nome e a senha combinados. Se a senha estiver errada, a API não permite redefini-la: recrie a rede com o servidor parado.
+A rede já foi criada. Não use `--create`; entre normalmente com o convite e a senha combinados. Se a senha estiver errada, a API não permite redefini-la: recrie a rede com o servidor parado.
 
 ### "Connection refused" ou timeout no servidor
 
@@ -291,9 +321,19 @@ O caminho padrão é relativo à pasta atual. Execute o servidor em uma pasta gr
 SHADOWVPN_NETWORKS_FILE=/caminho/gravavel/networks.json ./shadowvpn-server
 ```
 
+### O fingerprint do peer mudou
+
+A chave de identidade daquele computador foi recriada. Confirme com o dono do peer por um canal separado antes de continuar. Se a mudança foi legítima, reconecte; se não, trate como possível interferência do coordenador ou de um membro.
+
 ### Wine
 
 O instalador e a GUI do Windows abrem no Wine, mas a conexão real não funciona: o Wintun exige um driver de kernel do Windows e falha no Wine. Para testar a VPN, use Windows nativo ou uma VM Windows.
+
+## Atualizando de 0.3.x para 0.4.x
+
+Atualize servidor, clientes e GUI juntos. O protocolo de registro agora exige prova XEdDSA e os peers usam um PSK pairwise; clientes 0.3.x não são compatíveis com servidores 0.4.x e vice-versa.
+
+A chave `identity.key` existente continua válida e não é preciso recriar redes nem senhas. O fingerprint passa a ser exibido na GUI.
 
 ## Atualizando de 0.2.x para 0.3.x
 
