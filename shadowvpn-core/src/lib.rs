@@ -13,6 +13,19 @@ pub const RELAY_MAGIC: [u8; 4] = *b"SVPN";
 pub const RELAY_VERSION: u8 = 1;
 pub const RELAY_HEADER_LEN: usize = 22;
 
+/// Requisição para criar uma rede no servidor.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CreateNetworkRequest {
+    pub group_name: String,
+    pub group_password: String,
+}
+
+/// Resposta da criação de uma rede.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateNetworkResponse {
+    pub group_name: String,
+}
+
 /// Requisição para entrar em um grupo.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RegisterRequest {

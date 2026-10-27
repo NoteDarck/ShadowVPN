@@ -1,18 +1,26 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use anyhow::{bail, Context, Result};
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
 use rand_core::{OsRng as SessionOsRng, RngCore};
-use shadowvpn_core::{clean_hostname, PeerInfo, VIRTUAL_NETWORK_PREFIX};
+use serde::{Deserialize, Serialize};
+use shadowvpn_core::{clean_hostname, valid_group_name, PeerInfo, VIRTUAL_NETWORK_PREFIX};
+
+const NETWORKS_FILE_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateError {
     InvalidCredentials,
+    NetworkNotFound,
+    NetworkExists,
     GroupFull,
     SessionNotFound,
     Internal,
@@ -31,11 +39,23 @@ pub struct AppState {
     peer_ttl: Duration,
     relay_port: u16,
     relay_advertise: Option<String>,
+    networks_file: Option<PathBuf>,
 }
 
 struct ServerInner {
     groups: HashMap<String, Group>,
     sessions: HashMap<u64, SessionRef>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct NetworksFile {
+    version: u32,
+    networks: BTreeMap<String, StoredNetwork>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredNetwork {
+    password_hash: String,
 }
 
 #[derive(Clone)]
@@ -59,6 +79,7 @@ struct Peer {
 }
 
 impl AppState {
+    #[cfg(test)]
     pub fn new(peer_ttl: Duration, relay_port: u16, relay_advertise: Option<String>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(ServerInner {
@@ -68,7 +89,59 @@ impl AppState {
             peer_ttl,
             relay_port,
             relay_advertise,
+            networks_file: None,
         }
+    }
+
+    pub fn with_networks_file(
+        peer_ttl: Duration,
+        relay_port: u16,
+        relay_advertise: Option<String>,
+        networks_file: PathBuf,
+    ) -> Result<Self> {
+        let groups = load_networks(&networks_file)?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(ServerInner {
+                groups,
+                sessions: HashMap::new(),
+            })),
+            peer_ttl,
+            relay_port,
+            relay_advertise,
+            networks_file: Some(networks_file),
+        })
+    }
+
+    pub fn create_network(&self, group_name: &str, password: &str) -> Result<(), StateError> {
+        let mut inner = self.lock();
+        if inner.groups.contains_key(group_name) {
+            return Err(StateError::NetworkExists);
+        }
+
+        let password_hash = hash_password(password).ok_or(StateError::Internal)?;
+        inner.groups.insert(
+            group_name.to_owned(),
+            Group {
+                password_hash,
+                peers: HashMap::new(),
+            },
+        );
+
+        if let Some(path) = &self.networks_file {
+            if let Err(error) = save_networks(path, &inner.groups) {
+                inner.groups.remove(group_name);
+                tracing::error!(
+                    %group_name,
+                    path = %path.display(),
+                    error = %error,
+                    "não foi possível persistir a rede"
+                );
+                return Err(StateError::Internal);
+            }
+        }
+
+        tracing::info!(%group_name, "rede criada");
+        Ok(())
     }
 
     pub fn relay_address(&self, host_header: Option<&str>) -> String {
@@ -96,18 +169,9 @@ impl AppState {
 
         let ServerInner { groups, sessions } = &mut *inner;
 
-        if !groups.contains_key(group_name) {
-            let password_hash = hash_password(password).ok_or(StateError::Internal)?;
-            groups.insert(
-                group_name.to_owned(),
-                Group {
-                    password_hash,
-                    peers: HashMap::new(),
-                },
-            );
-        }
-
-        let group = groups.get_mut(group_name).ok_or(StateError::Internal)?;
+        let group = groups
+            .get_mut(group_name)
+            .ok_or(StateError::NetworkNotFound)?;
         if !verify_password(&group.password_hash, password) {
             return Err(StateError::InvalidCredentials);
         }
@@ -179,7 +243,7 @@ impl AppState {
         let group = inner
             .groups
             .get_mut(group_name)
-            .ok_or(StateError::InvalidCredentials)?;
+            .ok_or(StateError::NetworkNotFound)?;
 
         if !verify_password(&group.password_hash, password) {
             return Err(StateError::InvalidCredentials);
@@ -211,7 +275,7 @@ impl AppState {
 
         let group = groups
             .get_mut(group_name)
-            .ok_or(StateError::InvalidCredentials)?;
+            .ok_or(StateError::NetworkNotFound)?;
 
         if !verify_password(&group.password_hash, password) {
             return Err(StateError::InvalidCredentials);
@@ -313,7 +377,6 @@ impl ServerInner {
         for session_id in &expired {
             self.sessions.remove(session_id);
         }
-        self.groups.retain(|_, group| !group.peers.is_empty());
         expired.len()
     }
 }
@@ -395,12 +458,112 @@ fn hostname_from_header(value: &str) -> Option<String> {
     }
 }
 
+fn load_networks(path: &Path) -> Result<HashMap<String, Group>> {
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("não foi possível ler {}", path.display()))?;
+    if contents.trim().is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let stored: NetworksFile = serde_json::from_str(&contents)
+        .with_context(|| format!("arquivo de redes inválido: {}", path.display()))?;
+    if stored.version != NETWORKS_FILE_VERSION {
+        bail!(
+            "versão do arquivo de redes não suportada: {}",
+            stored.version
+        );
+    }
+
+    let mut groups = HashMap::with_capacity(stored.networks.len());
+    for (name, network) in stored.networks {
+        if !valid_group_name(&name) {
+            bail!("nome de rede inválido no arquivo: {name:?}");
+        }
+        if PasswordHash::new(&network.password_hash).is_err() {
+            bail!("hash de senha inválido para a rede {name:?}");
+        }
+        groups.insert(
+            name,
+            Group {
+                password_hash: network.password_hash,
+                peers: HashMap::new(),
+            },
+        );
+    }
+
+    Ok(groups)
+}
+
+fn save_networks(path: &Path, groups: &HashMap<String, Group>) -> Result<()> {
+    let networks = groups
+        .iter()
+        .map(|(name, group)| {
+            (
+                name.clone(),
+                StoredNetwork {
+                    password_hash: group.password_hash.clone(),
+                },
+            )
+        })
+        .collect();
+    let contents = serde_json::to_vec_pretty(&NetworksFile {
+        version: NETWORKS_FILE_VERSION,
+        networks,
+    })
+    .context("não foi possível serializar as redes")?;
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("não foi possível criar {}", parent.display()))?;
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("caminho do arquivo de redes inválido")?;
+    let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    {
+        use std::io::Write;
+        let mut file = options
+            .open(&temporary)
+            .with_context(|| format!("não foi possível abrir {}", temporary.display()))?;
+        file.write_all(&contents)
+            .with_context(|| format!("não foi possível escrever {}", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("não foi possível sincronizar {}", temporary.display()))?;
+    }
+
+    fs::rename(&temporary, path)
+        .with_context(|| format!("não foi possível substituir {}", path.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn state() -> AppState {
-        AppState::new(Duration::from_secs(75), 8081, None)
+        let state = AppState::new(Duration::from_secs(75), 8081, None);
+        state
+            .create_network("grupo", "senha-segura")
+            .expect("rede de teste");
+        state
     }
 
     fn key(n: u8) -> String {
@@ -470,6 +633,8 @@ mod tests {
     #[test]
     fn relay_only_forwards_inside_group() {
         let state = state();
+        state.create_network("a", "senha-segura").unwrap();
+        state.create_network("b", "senha-segura").unwrap();
         let first = state
             .register("a", "senha-segura", &key(1), "pc-1")
             .unwrap();
@@ -499,8 +664,11 @@ mod tests {
     }
 
     #[test]
-    fn expires_inactive_peers() {
+    fn expires_inactive_peers_and_keeps_network() {
         let state = AppState::new(Duration::from_millis(1), 8081, None);
+        state
+            .create_network("grupo", "senha-segura")
+            .expect("rede de teste");
         let first = state
             .register("grupo", "senha-segura", &key(1), "pc-1")
             .unwrap();
@@ -508,8 +676,73 @@ mod tests {
         assert_eq!(state.cleanup(), 1);
         assert!(matches!(
             state.heartbeat("grupo", "senha-segura", first.session_id),
+            Err(StateError::SessionNotFound)
+        ));
+
+        let again = state
+            .register("grupo", "senha-segura", &key(2), "pc-2")
+            .unwrap();
+        assert_eq!(again.virtual_ip, Ipv4Addr::new(26, 26, 26, 2));
+    }
+
+    #[test]
+    fn requires_network_to_exist_before_register() {
+        let state = state();
+        assert!(matches!(
+            state.register("rede-nova", "senha-segura", &key(1), "pc-1"),
+            Err(StateError::NetworkNotFound)
+        ));
+        assert!(state
+            .register("grupo", "senha-segura", &key(1), "pc-1")
+            .is_ok());
+        assert!(matches!(
+            state.create_network("grupo", "outra-senha"),
+            Err(StateError::NetworkExists)
+        ));
+    }
+
+    #[test]
+    fn persists_networks_and_hashes_passwords() {
+        let directory = tempfile::tempdir().expect("diretório temporário");
+        let path = directory.path().join("networks.json");
+        let state = AppState::with_networks_file(Duration::from_secs(75), 8081, None, path.clone())
+            .expect("estado persistente");
+        state
+            .create_network("rede-persistente", "senha-segura")
+            .expect("criar rede");
+
+        let contents = fs::read_to_string(&path).expect("arquivo de redes");
+        assert!(contents.contains("rede-persistente"));
+        assert!(!contents.contains("senha-segura"));
+
+        drop(state);
+        let reloaded = AppState::with_networks_file(Duration::from_secs(75), 8081, None, path)
+            .expect("recarregar estado");
+        let peer = reloaded
+            .register("rede-persistente", "senha-segura", &key(1), "pc-1")
+            .expect("entrar após reinício");
+        assert_eq!(peer.virtual_ip, Ipv4Addr::new(26, 26, 26, 2));
+        assert!(matches!(
+            reloaded.register("rede-persistente", "senha-errada", &key(2), "pc-2"),
             Err(StateError::InvalidCredentials)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restricts_network_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("diretório temporário");
+        let path = directory.path().join("networks.json");
+        let state = AppState::with_networks_file(Duration::from_secs(75), 8081, None, path.clone())
+            .expect("estado persistente");
+        state
+            .create_network("rede-privada", "senha-segura")
+            .expect("criar rede");
+
+        let mode = fs::metadata(&path).expect("metadados").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]

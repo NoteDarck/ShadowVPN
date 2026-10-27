@@ -3,7 +3,8 @@ use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use shadowvpn_core::{
-    PeersRequest, PeersResponse, RegisterRequest, RegisterResponse, UnregisterRequest,
+    CreateNetworkRequest, CreateNetworkResponse, ErrorResponse, PeersRequest, PeersResponse,
+    RegisterRequest, RegisterResponse, UnregisterRequest,
 };
 use std::time::Duration;
 
@@ -30,6 +31,22 @@ impl Api {
             .context("não foi possível criar o cliente HTTP")?;
 
         Ok(Self { client, base })
+    }
+
+    pub async fn create_network(
+        &self,
+        group_name: &str,
+        group_password: &str,
+    ) -> Result<CreateNetworkResponse> {
+        self.post_json(
+            "/networks",
+            &CreateNetworkRequest {
+                group_name: group_name.to_string(),
+                group_password: group_password.to_string(),
+            },
+        )
+        .await
+        .context("falha ao criar rede")
     }
 
     pub async fn register(
@@ -112,7 +129,10 @@ impl Api {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            bail!("servidor respondeu {status}: {body}");
+            let message = serde_json::from_str::<ErrorResponse>(&body)
+                .map(|error| error.error)
+                .unwrap_or(body);
+            bail!("servidor respondeu {status}: {message}");
         }
 
         response

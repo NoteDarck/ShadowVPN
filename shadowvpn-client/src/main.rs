@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use shadowvpn_client::{run, ClientConfig};
+use shadowvpn_client::{api::Api, run, ClientConfig};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -32,6 +32,10 @@ struct Args {
     /// Caminho da chave de identidade persistente.
     #[arg(long, env = "SHADOWVPN_IDENTITY")]
     identity: Option<PathBuf>,
+
+    /// Cria a rede no servidor antes de entrar. Falha se ela já existir.
+    #[arg(long, env = "SHADOWVPN_CREATE")]
+    create: bool,
 }
 
 #[tokio::main]
@@ -45,6 +49,13 @@ async fn main() -> Result<()> {
     let config =
         ClientConfig::new(args.server, args.group, password).with_identity_path(args.identity);
     config.validate()?;
+
+    if args.create {
+        let api = Api::new(&config.server)?;
+        api.create_network(&config.group_name, &config.group_password)
+            .await?;
+        tracing::info!(group = %config.group_name, "rede criada");
+    }
 
     let (stop_tx, stop_rx) = watch::channel(false);
     let mut session = Box::pin(run(config, stop_rx, None));

@@ -10,6 +10,7 @@ use axum::{
 use shadowvpn_core::{DEFAULT_HTTP_PORT, DEFAULT_PEER_TTL_SECS, DEFAULT_RELAY_PORT};
 use state::AppState;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
@@ -25,7 +26,15 @@ async fn main() -> Result<()> {
     let relay_port = relay_socket.local_addr()?.port();
     let relay_advertise = advertised_relay(relay_port);
 
-    let state = AppState::new(peer_ttl, relay_port, relay_advertise);
+    let networks_file = env_networks_file();
+    let state =
+        AppState::with_networks_file(peer_ttl, relay_port, relay_advertise, networks_file.clone())
+            .with_context(|| {
+                format!(
+                    "não foi possível carregar as redes de {}",
+                    networks_file.display()
+                )
+            })?;
     tokio::spawn(relay::run(state.clone(), relay_socket));
 
     let cleanup_state = state.clone();
@@ -43,6 +52,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/", get(root))
         .route("/health", get(routes::health))
+        .route("/networks", post(routes::create_network))
         .route("/register", post(routes::register))
         .route("/peers", post(routes::peers))
         .route("/unregister", post(routes::unregister))
@@ -54,6 +64,10 @@ async fn main() -> Result<()> {
 
     let http_bound = listener.local_addr()?;
     tracing::info!(address = %http_bound, "HTTP de coordenação ativo");
+    tracing::info!(
+        path = %networks_file.display(),
+        "redes persistidas neste arquivo"
+    );
     tracing::info!(ttl_secs = peer_ttl.as_secs(), "ShadowVPN iniciado");
 
     axum::serve(listener, app)
@@ -67,7 +81,7 @@ async fn root() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({
         "name": "ShadowVPN",
         "version": env!("CARGO_PKG_VERSION"),
-        "api": ["/register", "/peers", "/unregister", "/health"]
+        "api": ["/networks", "/register", "/peers", "/unregister", "/health"]
     }))
 }
 
@@ -83,6 +97,12 @@ fn env_address(name: &str, default_port: u16) -> Result<SocketAddr> {
     value
         .parse()
         .with_context(|| format!("{name} deve ser um endereço IP:porta válido"))
+}
+
+fn env_networks_file() -> PathBuf {
+    std::env::var_os("SHADOWVPN_NETWORKS_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("data/networks.json"))
 }
 
 fn env_peer_ttl() -> Duration {

@@ -47,6 +47,7 @@ Source: "{#StageDir}\shadowvpn-server.exe"; DestDir: "{app}"; Flags: ignoreversi
 Source: "{#StageDir}\wintun.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\wintun-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#StageDir}\docs\*"; DestDir: "{app}\docs"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#StageDir}\assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]

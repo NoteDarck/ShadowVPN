@@ -7,6 +7,7 @@ use shadowvpn_client::{ClientConfig, ClientEvent, ClientHandle};
 use shadowvpn_core::PeerInfo;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, TryRecvError};
 use std::time::Duration;
 
 const BG: Color32 = Color32::from_rgb(8, 15, 26);
@@ -23,6 +24,12 @@ const ACCENT_DARK: Color32 = Color32::from_rgb(20, 92, 82);
 const GREEN: Color32 = Color32::from_rgb(78, 210, 139);
 const AMBER: Color32 = Color32::from_rgb(238, 184, 88);
 const DANGER: Color32 = Color32::from_rgb(236, 103, 108);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntryMode {
+    Create,
+    Join,
+}
 
 fn main() -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
@@ -48,7 +55,12 @@ struct ShadowVpnApp {
     server: String,
     group: String,
     password: String,
+    confirm_password: String,
     identity_path: String,
+    entry_mode: EntryMode,
+    creating_network: bool,
+    create_result: Option<mpsc::Receiver<Result<(), String>>>,
+    created_network: Option<String>,
     show_password: bool,
     show_settings: bool,
     styled: bool,
@@ -74,7 +86,12 @@ impl Default for ShadowVpnApp {
             server: "http://127.0.0.1:8080".into(),
             group: "minha-rede".into(),
             password: String::new(),
+            confirm_password: String::new(),
             identity_path: String::new(),
+            entry_mode: EntryMode::Join,
+            creating_network: false,
+            create_result: None,
+            created_network: None,
             show_password: false,
             show_settings: false,
             styled: false,
@@ -225,14 +242,21 @@ impl ShadowVpnApp {
                             );
                         });
                         ui.add_space(4.0);
+                        let created = self.created_network_matches();
                         ui.label(
                             RichText::new(if self.connected {
                                 "Rede privada • conectada"
+                            } else if created {
+                                "Rede criada • pronta para entrar"
                             } else {
                                 "Rede privada"
                             })
                             .size(11.0)
-                            .color(MUTED),
+                            .color(if created && !self.connected {
+                                ACCENT
+                            } else {
+                                MUTED
+                            }),
                         );
                         if self.connected && !self.virtual_ip.is_empty() {
                             ui.add_space(3.0);
@@ -326,20 +350,43 @@ impl ShadowVpnApp {
     }
 
     fn connect_view(&mut self, ui: &mut egui::Ui) {
+        let server_before = self.server.clone();
+        let group_before = self.group.clone();
+        let password_before = self.password.clone();
+
         ui.add_space(8.0);
-        eyebrow(ui, "CONEXÃO");
+        self.entry_mode_selector(ui);
+        ui.add_space(18.0);
+
+        let creating = self.entry_mode == EntryMode::Create;
+        eyebrow(
+            ui,
+            if creating {
+                "CRIAR REDE"
+            } else {
+                "ENTRAR EM REDE"
+            },
+        );
         ui.add_space(4.0);
         ui.label(
-            RichText::new("Conecte-se a uma rede")
-                .size(28.0)
-                .strong()
-                .color(TEXT),
+            RichText::new(if creating {
+                "Crie sua rede privada"
+            } else {
+                "Entre em uma rede existente"
+            })
+            .size(28.0)
+            .strong()
+            .color(TEXT),
         );
         ui.add_space(2.0);
         ui.label(
-            RichText::new("Use os dados da rede compartilhados pelo administrador.")
-                .size(12.5)
-                .color(MUTED),
+            RichText::new(if creating {
+                "Escolha um nome e uma senha. A rede fica salva no servidor para os outros entrarem."
+            } else {
+                "Use o nome e a senha compartilhados por quem criou a rede."
+            })
+            .size(12.5)
+            .color(MUTED),
         );
         ui.add_space(16.0);
 
@@ -348,10 +395,11 @@ impl ShadowVpnApp {
             ui.add_space(10.0);
         }
         if let Some(notice) = &self.notice {
-            banner(ui, notice, AMBER);
+            banner(ui, notice, ACCENT);
             ui.add_space(10.0);
         }
 
+        let busy = self.handle.is_some() || self.creating_network || self.connecting;
         Frame::none()
             .fill(CARD)
             .stroke(Stroke::new(1.0_f32, BORDER))
@@ -359,41 +407,101 @@ impl ShadowVpnApp {
             .inner_margin(Margin::same(18.0))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                self.connection_fields(ui, false);
+                self.connection_fields(ui, busy, creating);
             });
 
+        if self.server != server_before
+            || self.group != group_before
+            || self.password != password_before
+        {
+            self.created_network = None;
+            self.notice = None;
+        }
+
         ui.add_space(14.0);
-        let busy = self.handle.is_some();
-        if primary_button(
-            ui,
-            if self.connecting {
-                "Conectando..."
+        let label = if self.creating_network {
+            "Criando rede..."
+        } else if self.connecting {
+            "Entrando..."
+        } else if creating {
+            "Criar rede"
+        } else {
+            "Entrar na rede"
+        };
+        if primary_button(ui, label, !busy) {
+            if creating {
+                self.create_network();
             } else {
-                "Conectar"
-            },
-            !busy,
-        ) {
-            self.connect();
+                self.connect();
+            }
         }
 
         ui.add_space(16.0);
-        ui.label(
-            RichText::new(
-                "A interface TUN exige privilégios de administrador. No Windows, mantenha \
-                 wintun.dll ao lado do executável.",
-            )
-            .size(10.5)
-            .color(MUTED),
-        );
-        ui.add_space(3.0);
-        ui.label(
-            RichText::new(
-                "O tráfego entre peers é cifrado com WireGuard; o servidor de relay não \
-                 consegue ler os pacotes.",
-            )
-            .size(10.5)
-            .color(MUTED),
-        );
+        if creating {
+            ui.label(
+                RichText::new(
+                    "Depois de criar, clique em Entrar na rede. Compartilhe o nome e a senha \
+                     com os outros computadores.",
+                )
+                .size(10.5)
+                .color(MUTED),
+            );
+            ui.add_space(3.0);
+            ui.label(
+                RichText::new(
+                    "Criar a rede não exige privilégios de administrador; conectar exige.",
+                )
+                .size(10.5)
+                .color(MUTED),
+            );
+        } else {
+            ui.label(
+                RichText::new(
+                    "A interface TUN exige privilégios de administrador. No Windows, mantenha \
+                     wintun.dll ao lado do executável.",
+                )
+                .size(10.5)
+                .color(MUTED),
+            );
+            ui.add_space(3.0);
+            ui.label(
+                RichText::new(
+                    "O tráfego entre peers é cifrado com WireGuard; o servidor de relay não \
+                     consegue ler os pacotes.",
+                )
+                .size(10.5)
+                .color(MUTED),
+            );
+        }
+    }
+
+    fn entry_mode_selector(&mut self, ui: &mut egui::Ui) {
+        let mut selected = self.entry_mode;
+        Frame::none()
+            .fill(CARD)
+            .stroke(Stroke::new(1.0_f32, BORDER))
+            .rounding(Rounding::same(10.0))
+            .inner_margin(Margin::same(4.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if mode_button(ui, "Criar rede", selected == EntryMode::Create) {
+                        selected = EntryMode::Create;
+                    }
+                    if mode_button(ui, "Entrar em rede", selected == EntryMode::Join) {
+                        selected = EntryMode::Join;
+                    }
+                });
+            });
+
+        if selected != self.entry_mode {
+            self.entry_mode = selected;
+            self.error = None;
+            self.notice = None;
+            self.status = match selected {
+                EntryMode::Create => "Preencha os dados da nova rede".into(),
+                EntryMode::Join => "Preencha os dados da rede".into(),
+            };
+        }
     }
 
     fn connecting_view(&mut self, ui: &mut egui::Ui) {
@@ -762,7 +870,7 @@ impl ShadowVpnApp {
         );
     }
 
-    fn connection_fields(&mut self, ui: &mut egui::Ui, busy: bool) {
+    fn connection_fields(&mut self, ui: &mut egui::Ui, busy: bool, creating: bool) {
         let enabled = !busy;
         ui.columns(2, |cols| {
             field_label(&mut cols[0], "SERVIDOR");
@@ -789,26 +897,45 @@ impl ShadowVpnApp {
             egui::TextEdit::singleline(&mut self.password)
                 .desired_width(f32::INFINITY)
                 .password(!self.show_password)
-                .hint_text("senha compartilhada pelo administrador"),
+                .hint_text(if creating {
+                    "crie uma senha com pelo menos 8 caracteres"
+                } else {
+                    "senha compartilhada por quem criou a rede"
+                }),
         );
+
+        if creating {
+            ui.add_space(10.0);
+            field_label(ui, "CONFIRMAR SENHA");
+            ui.add_enabled(
+                enabled,
+                egui::TextEdit::singleline(&mut self.confirm_password)
+                    .desired_width(f32::INFINITY)
+                    .password(!self.show_password)
+                    .hint_text("repita a senha da rede"),
+            );
+        }
+
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.show_password, "Mostrar senha");
         });
 
-        ui.add_space(10.0);
-        field_label(ui, "IDENTIDADE (OPCIONAL)");
-        ui.add_enabled(
-            enabled,
-            egui::TextEdit::singleline(&mut self.identity_path)
-                .desired_width(f32::INFINITY)
-                .hint_text("caminho da chave persistente"),
-        );
-        ui.add_space(6.0);
-        ui.label(
-            RichText::new("Se vazio, a chave é salva no diretório de configuração do sistema.")
-                .size(10.0)
-                .color(MUTED),
-        );
+        if !creating {
+            ui.add_space(10.0);
+            field_label(ui, "IDENTIDADE (OPCIONAL)");
+            ui.add_enabled(
+                enabled,
+                egui::TextEdit::singleline(&mut self.identity_path)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("caminho da chave persistente"),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("Se vazio, a chave é salva no diretório de configuração do sistema.")
+                    .size(10.0)
+                    .color(MUTED),
+            );
+        }
     }
 
     fn settings_window(&mut self, ctx: &egui::Context) {
@@ -824,7 +951,7 @@ impl ShadowVpnApp {
             .resizable(false)
             .default_width(540.0)
             .show(ctx, |ui| {
-                let busy = self.handle.is_some();
+                let busy = self.handle.is_some() || self.creating_network || self.connecting;
                 ui.label(
                     RichText::new("Dados da conexão")
                         .size(12.0)
@@ -832,7 +959,7 @@ impl ShadowVpnApp {
                         .color(TEXT),
                 );
                 ui.add_space(8.0);
-                self.connection_fields(ui, busy);
+                self.connection_fields(ui, busy, false);
                 if busy {
                     ui.add_space(8.0);
                     ui.label(
@@ -880,13 +1007,24 @@ impl ShadowVpnApp {
             ("Desconectando", AMBER)
         } else if self.connected {
             ("Conectado", GREEN)
+        } else if self.creating_network {
+            ("Criando rede", AMBER)
         } else if self.connecting {
             ("Conectando", AMBER)
+        } else if self.created_network_matches() {
+            ("Rede criada", ACCENT)
         } else if self.error.is_some() {
             ("Erro", DANGER)
         } else {
             ("Desconectado", MUTED)
         }
+    }
+
+    fn created_network_matches(&self) -> bool {
+        self.created_network
+            .as_deref()
+            .map(|network| network == self.group_name())
+            .unwrap_or(false)
     }
 
     fn group_name(&self) -> &str {
@@ -912,6 +1050,75 @@ impl ShadowVpnApp {
             image.as_raw(),
         );
         self.logo = Some(ctx.load_texture("shadowvpn-logo", color, egui::TextureOptions::LINEAR));
+    }
+
+    fn create_network(&mut self) {
+        self.error = None;
+        self.notice = None;
+        self.created_network = None;
+
+        if self.password != self.confirm_password {
+            self.error = Some("As senhas não coincidem.".into());
+            self.status = "Confira a confirmação da senha".into();
+            return;
+        }
+
+        let config =
+            ClientConfig::new(self.server.trim(), self.group.trim(), self.password.clone());
+        if let Err(error) = config.validate() {
+            self.error = Some(format!("{error:#}"));
+            self.status = "Dados da rede inválidos".into();
+            return;
+        }
+
+        let server = self.server.clone();
+        let group = self.group.clone();
+        let password = self.password.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.creating_network = true;
+        self.create_result = Some(receiver);
+        self.status = "Criando rede...".into();
+
+        std::thread::spawn(move || {
+            let result = shadowvpn_client::create_network(&server, &group, &password)
+                .map_err(|error| format!("{error:#}"));
+            let _ = sender.send(result);
+        });
+    }
+
+    fn poll_create_result(&mut self) {
+        let received = self
+            .create_result
+            .as_ref()
+            .map(|receiver| match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(Err(
+                    "a tarefa de criação da rede terminou sem resposta".into(),
+                )),
+            });
+
+        let Some(Some(result)) = received else {
+            return;
+        };
+
+        self.create_result = None;
+        self.creating_network = false;
+        match result {
+            Ok(()) => {
+                let network = self.group.trim().to_string();
+                self.created_network = Some(network.clone());
+                self.entry_mode = EntryMode::Join;
+                self.notice = Some(format!(
+                    "Rede \"{network}\" criada no servidor. Agora clique em Entrar na rede."
+                ));
+                self.status = "Rede criada".into();
+            }
+            Err(error) => {
+                self.error = Some(error);
+                self.status = "Falha ao criar a rede".into();
+            }
+        }
     }
 
     fn connect(&mut self) {
@@ -960,6 +1167,8 @@ impl ShadowVpnApp {
     }
 
     fn poll_events(&mut self) {
+        self.poll_create_result();
+
         let mut events = Vec::new();
         if let Some(handle) = &self.handle {
             while let Some(event) = handle.try_recv() {
@@ -1139,6 +1348,32 @@ fn banner(ui: &mut egui::Ui, text: &str, color: Color32) {
             ui.set_width(ui.available_width());
             ui.label(RichText::new(text).size(11.0).color(color));
         });
+}
+
+fn mode_button(ui: &mut egui::Ui, text: &str, selected: bool) -> bool {
+    ui.add(
+        egui::Button::new(RichText::new(text).size(12.0).color(if selected {
+            TEXT
+        } else {
+            MUTED
+        }))
+        .fill(if selected {
+            ACCENT_DARK
+        } else {
+            Color32::TRANSPARENT
+        })
+        .stroke(Stroke::new(
+            1.0_f32,
+            if selected {
+                ACCENT.gamma_multiply(0.65)
+            } else {
+                Color32::TRANSPARENT
+            },
+        ))
+        .rounding(Rounding::same(8.0))
+        .min_size(egui::vec2(132.0, 32.0)),
+    )
+    .clicked()
 }
 
 fn primary_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> bool {
