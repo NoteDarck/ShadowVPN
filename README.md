@@ -12,7 +12,7 @@ ShadowVPN é uma VPN de grupo inspirada no Radmin VPN, escrita em Rust. Cada com
 
 - Convites `shadowvpn://` que embutem servidor e rede; a senha nunca vai no link.
 - Criação explícita de redes, persistidas no servidor, com senha compartilhada.
-- IP virtual estável por identidade enquanto a sessão estiver ativa.
+- IP virtual estável por identidade, persistido no servidor mesmo após reinícios.
 - Criptografia ponta a ponta WireGuard entre os peers.
 - Identidade XEdDSA verificada pelo servidor e pelos peers, com fingerprint SHA-256.
 - PSK pairwise derivado por X25519/HKDF e aplicado ao WireGuard de cada par.
@@ -21,8 +21,10 @@ ShadowVPN é uma VPN de grupo inspirada no Radmin VPN, escrita em Rust. Cada com
 - Botão **Servidor local** no painel, com animação vermelha quando desligado e azul quando ligado.
 - Aba **Minhas redes** que guarda os convites das redes criadas neste computador.
 - Windows, Linux (x86_64 e aarch64) e macOS (Intel e Apple Silicon).
-- Redes sobrevivem a reinícios do servidor; sessões e peers continuam em memória.
-- Heartbeat, expiração de sessões e limpeza automática de peers inativos.
+- Redes sobrevivem a reinícios do servidor; sessões e peers ficam apenas em memória.
+- Heartbeat autenticado por token de sessão, expiração, limpeza automática e reconexão com backoff.
+- Autenticação administrativa por Bearer token para criar, listar, excluir e trocar a senha de redes.
+- Quota de redes configurável e deploy seguro com Docker Compose, Caddy e systemd.
 - Nomes dos computadores, fingerprints e latência do servidor exibidos na GUI.
 - Releases automatizados com AppImage, instalador Windows, checksums e `wintun.dll` no pacote Windows.
 
@@ -53,7 +55,7 @@ ShadowVPN é uma VPN de grupo inspirada no Radmin VPN, escrita em Rust. Cada com
 3. O servidor valida a senha e a prova XEdDSA, aloca um IP virtual e devolve a lista de peers (cada um com sua prova e fingerprint) e o endereço do relay.
 4. O cliente verifica a prova de cada peer, calcula um PSK pairwise com X25519/HKDF e cria a interface TUN; em seguida envia um `HELLO` UDP ao relay.
 5. Cada peer mantém uma sessão WireGuard com os demais usando o PSK do par. O relay encaminha os datagramas pelo `session_id` de destino.
-6. A cada 20 segundos o cliente reenvia o registro (idempotente) para renovar a sessão e atualizar a lista de peers.
+6. A cada 20 segundos o cliente faz `POST /peers` usando o token de sessão, sem reenviar a senha, para renovar o peer e atualizar a lista. Se o servidor ficar inacessível, o cliente tenta reconectar com backoff exponencial até 30 segundos.
 
 O convite reúne o endereço do coordenador e o nome da rede. Ele não inclui a senha, não substitui o servidor e não é um serviço central: alguém ainda precisa hospedar o `shadowvpn-server`.
 
@@ -73,15 +75,21 @@ Para um passo a passo mais detalhado, incluindo Windows, Linux, firewall e solu�
 
 ### 1. Servidor
 
+Para uso local, o modo mais simples é ligar o servidor pelo botão **Servidor local** da GUI: ele cria um token administrativo automaticamente. Para iniciar manualmente com autenticação:
+
 ```bash
-cargo run --release -p shadowvpn-server
+mkdir -p data
+SHADOWVPN_ADMIN_TOKEN_FILE="$PWD/data/admin-token" \
+  cargo run --release -p shadowvpn-server
 ```
 
-Por padrão, o servidor escuta em `0.0.0.0:8080` (HTTP) e `0.0.0.0:8081` (UDP relay). Para conferir:
+Na primeira execução, o servidor cria `data/admin-token` com permissão `0600`. Leia o token com `cat data/admin-token` e guarde-o como segredo. Por padrão, o servidor escuta em `0.0.0.0:8080` (HTTP) e `0.0.0.0:8081` (UDP relay). Para conferir:
 
 ```bash
 curl http://127.0.0.1:8080/health
 ```
+
+Sem `SHADOWVPN_ADMIN_TOKEN` nem `SHADOWVPN_ADMIN_TOKEN_FILE`, a criação de redes fica aberta e o servidor registra um aviso. Para uma rede não confiável, configure o token e use HTTPS conforme [docs/DEPLOY.md](docs/DEPLOY.md).
 
 Se o servidor estiver atrás de proxy reverso ou NAT, informe o endereço público do relay:
 
@@ -94,23 +102,24 @@ SHADOWVPN_RELAY_ADVERTISE=vpn.exemplo.com:8081 cargo run --release -p shadowvpn-
 A rede deve ser criada uma vez, antes que os computadores entrem. Use a GUI na aba **Criar rede** ou a CLI:
 
 ```bash
-SHADOWVPN_SERVER=http://vpn.exemplo.com:8080 \
-SHADOWVPN_GROUP=minha-rede \
-SHADOWVPN_PASSWORD='uma-senha-forte' \
-cargo run --release -p shadowvpn-client -- --create
+SHADOWVPN_SERVER=https://vpn.exemplo.com \
+SHADOWVPN_ADMIN_TOKEN='COLE_O_TOKEN' \
+cargo run --release -p shadowvpn-client -- create-network \
+  --name minha-rede --password 'uma-senha-forte'
 ```
 
-`--create` cria a rede e já conecta este computador. Ao criar, o log imprime um link `shadowvpn://` com servidor e rede. Se a rede já existir, o servidor responde `409 Conflict`; nesse caso entre sem `--create`.
-
-Também é possível criar apenas a rede via API:
+O subcomando `create-network` cria a rede sem conectar e imprime o link `shadowvpn://`. Se a rede já existir, o servidor responde `409 Conflict`. O comando equivalente via API, agora protegido por token, é:
 
 ```bash
-curl -X POST http://vpn.exemplo.com:8080/networks \
+curl -X POST https://vpn.exemplo.com/networks \
+  -H "Authorization: Bearer COLE_O_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"group_name":"minha-rede","group_password":"uma-senha-forte"}'
 ```
 
-Guarde o arquivo de redes do servidor: ele contém os hashes das senhas. No servidor manual o padrão é `data/networks.json`; no servidor iniciado pela GUI, é a pasta de dados do usuário descrita abaixo. Sem esse arquivo, será necessário recriar as redes após um reinício.
+O antigo `--create` continua disponível: ele cria a rede e já conecta este computador.
+
+Guarde o arquivo de redes do servidor: ele contém os hashes das senhas, os IPs virtuais persistidos e não deve ser publicado. No servidor manual o padrão é `data/networks.json`; no servidor iniciado pela GUI, é a pasta de dados do usuário descrita abaixo. Sem esse arquivo, será necessário recriar as redes após um reinício.
 
 ### 3. Entrar na rede
 
@@ -119,7 +128,7 @@ Em outro computador, com a mesma versão, cole o convite, informe a senha e use 
 ```bash
 SHADOWVPN_PASSWORD='uma-senha-forte' \
 cargo run --release -p shadowvpn-client -- \
-  --invite 'shadowvpn://join?server=http%3A%2F%2Fvpn.exemplo.com%3A8080&network=minha-rede'
+  --invite 'shadowvpn://join?server=https%3A%2F%2Fvpn.exemplo.com&network=minha-rede'
 ```
 
 Também é possível informar `--server` e `--group` manualmente, sem convite. O cliente imprime o IP virtual e o relay nos logs. Use `SHADOWVPN_LOG=debug` para mais detalhes.
@@ -163,12 +172,24 @@ Flags da CLI (as variáveis de ambiente equivalentes estão entre parênteses):
 | `--invite` | `SHADOWVPN_INVITE` | — |
 | `--server` | `SHADOWVPN_SERVER` | `http://127.0.0.1:8080` se não houver convite |
 | `--group` | `SHADOWVPN_GROUP` | `minha-rede` se não houver convite |
-| `--password` | `SHADOWVPN_PASSWORD` | obrigatória |
+| `--password` | `SHADOWVPN_PASSWORD` | obrigatória para conectar ou usar `--create` |
+| `--admin-token` | `SHADOWVPN_ADMIN_TOKEN` | — (necessário para criar/gerenciar redes protegidas) |
+| `--admin-token-file` | `SHADOWVPN_ADMIN_TOKEN_FILE` | — (alternativa ao token inline) |
 | `--identity` | `SHADOWVPN_IDENTITY` | caminho padrão do sistema |
 | `--create` | `SHADOWVPN_CREATE` | `false` |
+| subcomandos | — | `create-network`, `list-networks`, `delete-network`, `rotate-password` |
 | — | `SHADOWVPN_HOSTNAME` | hostname do sistema; exibido aos peers |
 
-Prefira `SHADOWVPN_PASSWORD` em vez de `--password`: argumentos de linha de comando podem aparecer no histórico e na lista de processos.
+Prefira variáveis de ambiente ou arquivos em vez de `--password` e `--admin-token`: argumentos de linha de comando podem aparecer no histórico e na lista de processos. O token em `SHADOWVPN_ADMIN_TOKEN_FILE` é lido do arquivo e nunca precisa ser passado inline.
+
+Os subcomandos administrativos aceitam `--server`, `SHADOWVPN_SERVER`, `--admin-token` e `SHADOWVPN_ADMIN_TOKEN_FILE`. Exemplos:
+
+```bash
+shadowvpn-client list-networks
+shadowvpn-client create-network --name minha-rede --password 'uma-senha-forte'
+shadowvpn-client rotate-password minha-rede --new-password 'outra-senha-forte'
+shadowvpn-client delete-network minha-rede
+```
 
 O nome do grupo deve ter até 64 caracteres alfanuméricos, `-` ou `_`. A senha deve ter entre 8 e 128 caracteres. O convite tem precedência sobre `--server` e `--group`.
 
@@ -196,7 +217,7 @@ Quando o servidor é iniciado pelo botão **Servidor local** da GUI, o arquivo d
 - macOS: `~/Library/Application Support/shadowvpn/networks.json`
 - Windows: `%APPDATA%\ShadowVPN\networks.json`
 
-O log `server.log` fica na mesma pasta, e `SHADOWVPN_NETWORKS_FILE` continua tendo precedência. Redes criadas em um servidor iniciado manualmente na pasta atual não aparecem automaticamente nesse arquivo; use o mesmo `SHADOWVPN_NETWORKS_FILE` ou copie o `networks.json`.
+O log `server.log` e o token `admin-token` ficam na mesma pasta; para administrar o servidor local pela CLI, aponte `SHADOWVPN_ADMIN_TOKEN_FILE` para ele ou use `SHADOWVPN_ADMIN_TOKEN`. `SHADOWVPN_NETWORKS_FILE` continua tendo precedência. Redes criadas em um servidor iniciado manualmente na pasta atual não aparecem automaticamente nesse arquivo; use o mesmo `SHADOWVPN_NETWORKS_FILE` ou copie o `networks.json`.
 
 ### Servidor
 
@@ -206,7 +227,10 @@ O log `server.log` fica na mesma pasta, e `SHADOWVPN_NETWORKS_FILE` continua ten
 | `SHADOWVPN_RELAY_LISTEN` | `0.0.0.0:8081` | Endereço UDP do relay |
 | `SHADOWVPN_RELAY_ADVERTISE` | derivado do `Host` | Endereço público do relay devolvido aos clientes |
 | `SHADOWVPN_PEER_TTL` | `75` | Segundos sem heartbeat até remover o peer (mínimo 30) |
-| `SHADOWVPN_NETWORKS_FILE` | `data/networks.json` (manual) ou pasta de dados do usuário (GUI) | Arquivo JSON com as redes e hashes de senha |
+| `SHADOWVPN_NETWORKS_FILE` | `data/networks.json` (manual) ou pasta de dados do usuário (GUI) | Arquivo JSON com redes, hashes e IPs persistentes |
+| `SHADOWVPN_ADMIN_TOKEN` | — | Token Bearer com pelo menos 16 caracteres; habilita criação/gestão autenticada |
+| `SHADOWVPN_ADMIN_TOKEN_FILE` | — | Arquivo com o token; criado com permissão `0600` se não existir |
+| `SHADOWVPN_MAX_NETWORKS` | `1000` | Limite de redes no servidor |
 | `SHADOWVPN_LOG` ou `RUST_LOG` | `info` | Filtro de logs, por exemplo `debug` |
 
 Se `SHADOWVPN_RELAY_ADVERTISE` não for definido, o servidor usa o host do cabeçalho HTTP `Host` e a porta UDP efetiva. Em produção atrás de proxy reverso, defina explicitamente o endereço público:
@@ -222,12 +246,15 @@ Para IPv6, use colchetes: `SHADOWVPN_RELAY_ADVERTISE=[2001:db8::10]:8081`.
 | Método | Rota | Função |
 |---|---|---|
 | `GET` | `/health` | Saúde do servidor |
-| `POST` | `/networks` | Criar uma rede (nome e senha) |
-| `POST` | `/register` | Entrar em uma rede existente, provar posse da chave WireGuard e obter IP, sessão e peers |
-| `POST` | `/peers` | Heartbeat alternativo e lista atualizada de peers |
-| `POST` | `/unregister` | Sair do grupo |
+| `POST` | `/networks` | Criar uma rede (exige Bearer token quando a administração está configurada) |
+| `POST` | `/register` | Entrar em uma rede existente, provar posse da chave WireGuard e obter IP, sessão, token de sessão e peers |
+| `POST` | `/peers` | Heartbeat e lista atualizada de peers; aceita `session_token` ou a senha legada |
+| `POST` | `/unregister` | Sair do grupo; aceita `session_token` ou a senha legada |
+| `GET` | `/admin/networks` | Listar redes, peers online e membros conhecidos (Bearer token) |
+| `DELETE` | `/admin/networks/{nome}` | Excluir uma rede e suas sessões (Bearer token) |
+| `POST` | `/admin/networks/{nome}/password` | Trocar a senha e encerrar sessões (Bearer token) |
 
-As redes são persistidas em `data/networks.json` no servidor manual ou na pasta de dados do usuário quando o servidor é iniciado pela GUI (configurável por `SHADOWVPN_NETWORKS_FILE` em ambos os casos), e sobrevivem a reinícios. Peers e sessões ficam em memória e são perdidos no reinício; os clientes renovam o registro no próximo heartbeat, mas podem precisar reconectar se o IP virtual mudar. O arquivo contém apenas hashes Argon2 e recebe permissão `0600` no Unix. O `POST /register` exige o objeto `identity` com a assinatura XEdDSA da chave pública e da rede.
+As redes são persistidas em `data/networks.json` no servidor manual ou na pasta de dados do usuário quando o servidor é iniciado pela GUI (configurável por `SHADOWVPN_NETWORKS_FILE` em ambos os casos), e sobrevivem a reinícios. O arquivo guarda hashes Argon2 e o mapa de membros com os IPs virtuais estáveis; peers e sessões ativas ficam em memória e são perdidos no reinício, mas o cliente reconecta automaticamente e recupera o mesmo IP. O arquivo recebe permissão `0600` no Unix. O `POST /register` exige o objeto `identity` com a assinatura XEdDSA da chave pública e da rede.
 
 ## Portas, firewall e HTTPS
 
@@ -235,15 +262,7 @@ As redes são persistidas em `data/networks.json` no servidor manual ou na pasta
 - **8081/udp**: relay. Precisa estar acessível diretamente pelos clientes; não é proxy HTTP.
 - Libere as duas portas no firewall do servidor e no provedor de nuvem.
 
-Exemplo de proxy TLS com Caddy:
-
-```caddyfile
-vpn.exemplo.com {
-    reverse_proxy 127.0.0.1:8080
-}
-```
-
-Nesse caso, mantenha `SHADOWVPN_LISTEN=127.0.0.1:8080` e configure `SHADOWVPN_RELAY_ADVERTISE=vpn.exemplo.com:8081`. Sem HTTPS, a senha do grupo, as chaves públicas e as provas de identidade trafegam em texto claro. O link de convite contém apenas servidor e rede; nunca inclua a senha nele.
+A implantação completa com Docker Compose, Caddy, systemd, backup e rotação de token está em [docs/DEPLOY.md](docs/DEPLOY.md). Nesse caso, mantenha `SHADOWVPN_LISTEN=127.0.0.1:8080` e configure `SHADOWVPN_RELAY_ADVERTISE=vpn.exemplo.com:8081`. Sem HTTPS, a senha do grupo, o token de sessão, as chaves públicas e as provas de identidade trafegam em texto claro. O link de convite contém apenas servidor e rede; nunca inclua a senha ou o token nele.
 
 ## Permissões por sistema
 
@@ -260,7 +279,7 @@ Depois execute normalmente. Se preferir `sudo`:
 
 ```bash
 sudo env \
-  SHADOWVPN_SERVER=http://vpn.exemplo.com:8080 \
+  SHADOWVPN_SERVER=https://vpn.exemplo.com \
   SHADOWVPN_GROUP=minha-rede \
   SHADOWVPN_PASSWORD='uma-senha-forte' \
   ./target/release/shadowvpn-client
@@ -271,8 +290,8 @@ Use um `SHADOWVPN_IDENTITY` explícito se quiser que a chave criada pelo process
 O AppImage não carrega capabilities. Para usar a GUI empacotada, execute com `sudo`:
 
 ```bash
-chmod +x ShadowVPN-v0.4.2-linux-x86_64.AppImage
-sudo -E ./ShadowVPN-v0.4.2-linux-x86_64.AppImage
+chmod +x ShadowVPN-v0.5.0-linux-x86_64.AppImage
+sudo -E ./ShadowVPN-v0.5.0-linux-x86_64.AppImage
 ```
 
 Alternativamente, extraia o AppImage com `--appimage-extract` e aplique `CAP_NET_ADMIN` ao binário interno.
@@ -295,7 +314,7 @@ sudo ./shadowvpn-client
 Se o arquivo foi baixado pelo navegador e o Gatekeeper bloquear:
 
 ```bash
-xattr -dr com.apple.quarantine ShadowVPN-v0.4.2-macos-aarch64
+xattr -dr com.apple.quarantine ShadowVPN-v0.5.0-macos-aarch64
 ```
 
 Os binários não são assinados nem notarizados.
@@ -312,7 +331,7 @@ Cada tag `v*` dispara `.github/workflows/release.yml` e publica:
 | macOS Intel | `ShadowVPN-vX.Y.Z-macos-x86_64.tar.gz` |
 | macOS Apple Silicon | `ShadowVPN-vX.Y.Z-macos-aarch64.tar.gz` |
 
-Os arquivos compactados incluem `shadowvpn-client`, `shadowvpn-server` e `shadowvpn-gui`; os AppImages incluem os três binários, o arquivo `.desktop` e o ícone para integração com o desktop. O pacote Windows portátil e o instalador incluem `wintun.dll` e a licença da Wintun. O release também publica `SHA256SUMS.txt` com os checksums de todos os artefatos.
+Os arquivos compactados incluem `shadowvpn-client`, `shadowvpn-server`, `shadowvpn-gui`, `docs/` e `deploy/`; os AppImages incluem os três binários, o arquivo `.desktop` e o ícone para integração com o desktop. O pacote Windows portátil e o instalador incluem `wintun.dll` e a licença da Wintun. O release também publica `SHA256SUMS.txt` com os checksums de todos os artefatos.
 
 Os binários Linux x86_64 são compilados no Ubuntu 22.04 (glibc 2.35) e os de aarch64 no Ubuntu 24.04 (glibc 2.39). A GUI Linux também precisa de bibliotecas de sistema para Wayland/X11 e OpenGL.
 
@@ -321,8 +340,8 @@ O instalador Windows foi compilado com Inno Setup e registra `shadowvpn-gui.exe`
 Para criar uma release:
 
 ```bash
-git tag v0.4.2
-git push origin v0.4.2
+git tag v0.5.0
+git push origin v0.5.0
 ```
 
 Também é possível executar o workflow manualmente em **Actions → Release multiplataforma → Run workflow**, informando uma tag que já exista no remoto.
@@ -345,11 +364,11 @@ Binários gerados em `target/release/`: `shadowvpn-server`, `shadowvpn-client` e
 - O PSK do WireGuard é derivado por X25519 entre as chaves estáticas dos dois peers e HKDF-SHA256 com contexto da rede e das duas chaves. O servidor não participa desse cálculo e não consegue derivar o PSK.
 - XEdDSA é o algoritmo de identidade usado pelo Signal, mas o ShadowVPN **não implementa X3DH nem Double Ratchet**. A confidencialidade do transporte continua sendo a do WireGuard; o PSK pairwise é estático e não acrescenta ratcheting ou recuperação pós-comprometimento.
 - O fingerprint exibido na GUI é `SHA-256(chave pública WireGuard)` em base64. Compare-o com o outro computador por um canal separado se quiser detectar um coordenador mal-intencionado que tente substituir peers por chaves próprias.
-- A API de coordenação usa HTTP simples. Em qualquer rede não confiável, coloque-a atrás de HTTPS. A senha do grupo é enviada a cada requisição.
+- A API de coordenação pode usar HTTP simples em laboratório. Em qualquer rede não confiável, use HTTPS. A senha da rede só é enviada no registro; o heartbeat seguinte usa um token de sessão aleatório.
 - O servidor armazena apenas o hash Argon2 da senha do grupo. A senha em texto claro existe somente durante a requisição.
 - Os `session_id` são compartilhados com os peers do grupo para permitir o roteamento. Um membro mal-intencionado do grupo pode tentar interferir no relay; o WireGuard ainda impede a leitura ou falsificação dos pacotes, mas indisponibilidade e metadados não são protegidos.
-- Qualquer pessoa que alcance a API pode criar uma rede nova e definir a senha dela. Use nomes difíceis de adivinhar ou restrinja o acesso à API. Depois de criada, a rede não pode ser recriada ou ter a senha alterada pela API; exclua-a do arquivo com o servidor parado ou implemente administração autenticada.
-- Não há rate limiting nem cotas por IP. Para um servidor público, coloque a API atrás de um proxy com limites de requisição e monitore o consumo de memória/CPU.
+- Com `SHADOWVPN_ADMIN_TOKEN` configurado, criar, listar, excluir e trocar senhas exige Bearer token; sem token, a criação fica aberta e o servidor avisa no log. O token é comparado em tempo constante e deve ser tratado como segredo.
+- Há quota de redes (`SHADOWVPN_MAX_NETWORKS`), mas não há rate limiting por IP. Para um servidor público, coloque a API atrás de um proxy/CDN com limites de requisição e monitore o consumo de memória/CPU.
 - Não há auditoria de segurança independente, testes de penetração ou garantia de anonimato.
 
 ## Limitações
@@ -360,10 +379,10 @@ Binários gerados em `target/release/`: `shadowvpn-server`, `shadowvpn-client` e
 - **IPv4 apenas**: rede virtual `/24`, máximo de 253 peers por grupo.
 - **Sem multicast**: broadcast IPv4 é replicado para os peers, mas multicast não é suportado.
 - **Sem DNS próprio**: acesse os peers pelo IP virtual; os nomes são apenas exibidos na GUI.
-- **Sessões em memória**: redes e hashes de senha são persistidos, mas peers e sessões são perdidos ao reiniciar o servidor.
+- **Sessões em memória**: redes, hashes, membros e IPs virtuais persistem, mas peers e sessões ativas são perdidos ao reiniciar; o cliente reconecta automaticamente e mantém o IP.
 - **Sem NAT traversal para o servidor**: o relay UDP precisa ser alcançável na porta publicada.
 - **Convite sem senha**: o link contém servidor e rede, mas a senha deve ser enviada por outro canal.
-- **Instalação limitada**: há instalador para Windows e AppImage para Linux; macOS continua apenas com binários portáveis. Não há serviço nem inicialização automática.
+- **Instalação limitada**: há instalador para Windows, AppImage para Linux e units systemd em `deploy/systemd`; não há tray, autostart universal ou serviço nativo para macOS.
 - **Sem assinatura de código**: Windows SmartScreen, o instalador e o macOS Gatekeeper podem avisar.
 - **Sem túnel de internet completa**: apenas a sub-rede virtual é roteada.
 
@@ -384,17 +403,17 @@ Binários gerados em `target/release/`: `shadowvpn-server`, `shadowvpn-client` e
 - Se estiver atrás de proxy reverso, o cabeçalho `Host` pode não ser o endereço do relay.
 
 **A conexão cai após reiniciar o servidor**
-- Redes persistem, mas sessões não. Aguarde o próximo heartbeat ou reconecte o cliente. Se o IP virtual mudou, a GUI pede reconexão.
+- O cliente detecta a queda no heartbeat e reconecta com backoff. Redes, membros e IPs persistem; as sessões antigas não. Se a rede tiver sido excluída ou a senha trocada, a reconexão falha e a GUI mostra o erro.
 
 **Linux: erro de permissão em `/dev/net/tun`**
 - Confirme que o dispositivo existe: `ls -l /dev/net/tun`.
 - Use `sudo` ou `setcap cap_net_admin+ep` no binário.
 
-## Atualizando de 0.3.x para 0.4.x
+## Atualizando de 0.4.x para 0.5.x
 
-O protocolo de registro mudou: o servidor 0.4.x exige a prova XEdDSA e os peers exigem o PSK pairwise. Atualize servidor, clientes e GUI juntos. Clientes 0.3.x não conseguem entrar em redes 0.4.x e vice-versa.
+O servidor 0.5.x adiciona token de sessão, IPs persistentes, administração autenticada e quota de redes. Clientes antigos continuam aceitos pelo fallback de senha, mas devem ser atualizados para usar heartbeat por token e reconexão automática. O cliente 0.5.x exige servidor 0.5.x: atualize o servidor primeiro e depois os clientes.
 
-A chave `identity.key` existente continua válida; a identidade XEdDSA é derivada dela. O fingerprint passa a aparecer na GUI e não requer recriar redes nem senhas.
+A chave `identity.key` existente continua válida e o fingerprint não muda. Redes e senhas não precisam ser recriadas. O `networks.json` v1 é lido automaticamente e migra para v2 quando um peer se registra. Faça backup antes de atualizar; rode servidor e clientes novos juntos quando possível.
 
 ## Estrutura
 
@@ -404,7 +423,8 @@ shadowvpn-crypto/  XEdDSA, fingerprints e derivação do PSK pairwise
 shadowvpn-server/  API HTTP, redes persistentes, sessões e relay UDP
 shadowvpn-client/  API, identidade, TUN, WireGuard e motor do cliente
 shadowvpn-gui/     Interface desktop egui/eframe
-docs/              Guia de conexão passo a passo
+docs/              Guia de conexão e implantação segura
+deploy/            Docker Compose, Caddy, Dockerfile e units systemd
 assets/            Ícone e identidade visual do ShadowVPN
 .github/           CI e release multiplataforma
 ```

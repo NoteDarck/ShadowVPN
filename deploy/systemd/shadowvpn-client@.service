@@ -1,0 +1,26 @@
+[Unit]
+Description=ShadowVPN client (%i)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=shadowvpn
+Group=shadowvpn
+StateDirectory=shadowvpn-client
+EnvironmentFile=/etc/shadowvpn/%i.env
+Environment=SHADOWVPN_IDENTITY=/var/lib/shadowvpn-client/identity.key
+ExecStart=/usr/local/bin/shadowvpn-client
+Restart=on-failure
+RestartSec=5
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target

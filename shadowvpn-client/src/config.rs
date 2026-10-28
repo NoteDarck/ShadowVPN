@@ -8,6 +8,7 @@ pub struct ClientConfig {
     pub group_name: String,
     pub group_password: String,
     pub identity_path: Option<PathBuf>,
+    pub admin_token: Option<String>,
 }
 
 impl ClientConfig {
@@ -21,11 +22,19 @@ impl ClientConfig {
             group_name: group_name.into(),
             group_password: group_password.into(),
             identity_path: None,
+            admin_token: None,
         }
     }
 
     pub fn with_identity_path(mut self, path: Option<PathBuf>) -> Self {
         self.identity_path = path;
+        self
+    }
+
+    pub fn with_admin_token(mut self, token: Option<String>) -> Self {
+        self.admin_token = token
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         self
     }
 

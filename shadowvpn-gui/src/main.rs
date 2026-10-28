@@ -81,6 +81,8 @@ struct ShadowVpnApp {
     group: String,
     password: String,
     confirm_password: String,
+    admin_token: String,
+    show_admin_token: bool,
     identity_path: String,
     invite_input: String,
     identity_fingerprint: String,
@@ -140,6 +142,8 @@ impl Default for ShadowVpnApp {
             group,
             password: String::new(),
             confirm_password: String::new(),
+            admin_token: String::new(),
+            show_admin_token: false,
             identity_path: String::new(),
             invite_input: String::new(),
             identity_fingerprint: String::new(),
@@ -1553,10 +1557,29 @@ impl ShadowVpnApp {
                     .password(!self.show_password)
                     .hint_text("repita a senha da rede"),
             );
+
+            ui.add_space(10.0);
+            field_label(ui, "TOKEN DE ADMINISTRAÇÃO (SE EXIGIDO)");
+            ui.add_enabled(
+                enabled,
+                egui::TextEdit::singleline(&mut self.admin_token)
+                    .desired_width(f32::INFINITY)
+                    .password(!self.show_admin_token)
+                    .hint_text("necessário apenas em servidor protegido"),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Em servidor local o token é usado automaticamente e não é salvo.")
+                    .size(10.0)
+                    .color(MUTED),
+            );
         }
 
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.show_password, "Mostrar senha");
+            if creating {
+                ui.checkbox(&mut self.show_admin_token, "Mostrar token");
+            }
         });
 
         if !creating {
@@ -1715,14 +1738,30 @@ impl ShadowVpnApp {
         let server = self.server.clone();
         let group = self.group.clone();
         let password = self.password.clone();
+        let admin_token = {
+            let value = self.admin_token.trim();
+            let local_url = self.local_server.url();
+            let using_local_server = is_loopback_url(&self.server)
+                || self.server.trim().trim_end_matches('/') == local_url;
+            if value.is_empty() && using_local_server {
+                local_server::local_admin_token()
+            } else {
+                (!value.is_empty()).then(|| value.to_string())
+            }
+        };
         let (sender, receiver) = mpsc::channel();
         self.creating_network = true;
         self.create_result = Some(receiver);
         self.status = "Criando rede...".into();
 
         std::thread::spawn(move || {
-            let result = shadowvpn_client::create_network(&server, &group, &password)
-                .map_err(|error| format!("{error:#}"));
+            let result = shadowvpn_client::create_network(
+                &server,
+                &group,
+                &password,
+                admin_token.as_deref(),
+            )
+            .map_err(|error| format!("{error:#}"));
             let _ = sender.send(result);
         });
     }
@@ -1872,6 +1911,21 @@ impl ShadowVpnApp {
                         self.notice = Some(status);
                     } else {
                         self.status = status;
+                    }
+                }
+                ClientEvent::Reconnecting {
+                    attempt,
+                    delay_secs,
+                    message,
+                } => {
+                    if !self.stopping {
+                        self.connected = false;
+                        self.connecting = true;
+                        self.clear_session();
+                        self.status = format!(
+                            "Conexão perdida. Reconectando ({attempt}) em {delay_secs}s..."
+                        );
+                        self.notice = Some(format!("Tentativa {attempt} falhou: {message}"));
                     }
                 }
                 ClientEvent::Error(error) => {

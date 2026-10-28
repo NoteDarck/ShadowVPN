@@ -1,0 +1,11 @@
+target
+.git
+.github
+data
+deploy/.env
+*.AppImage
+*.tar.gz
+*.zip
+*.deb
+*.rpm
+*.log

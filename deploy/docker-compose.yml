@@ -1,0 +1,52 @@
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    environment:
+      SHADOWVPN_LISTEN: 0.0.0.0:8080
+      SHADOWVPN_RELAY_LISTEN: 0.0.0.0:8081
+      SHADOWVPN_NETWORKS_FILE: /var/lib/shadowvpn/networks.json
+      SHADOWVPN_ADMIN_TOKEN_FILE: /var/lib/shadowvpn/admin-token
+      SHADOWVPN_MAX_NETWORKS: ${SHADOWVPN_MAX_NETWORKS:-1000}
+      SHADOWVPN_RELAY_ADVERTISE: ${SHADOWVPN_DOMAIN}:${SHADOWVPN_RELAY_PORT:-8081}
+      SHADOWVPN_LOG: ${SHADOWVPN_LOG:-info}
+    volumes:
+      - shadowvpn-data:/var/lib/shadowvpn
+    ports:
+      - "${SHADOWVPN_RELAY_PORT:-8081}:8081/udp"
+    expose:
+      - "8080"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - web
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - server
+    environment:
+      SHADOWVPN_DOMAIN: ${SHADOWVPN_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - web
+
+volumes:
+  shadowvpn-data:
+  caddy-data:
+  caddy-config:
+
+networks:
+  web:

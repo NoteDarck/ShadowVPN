@@ -1,6 +1,6 @@
 [package]
 name = "shadowvpn-gui"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2021"
 
 [dependencies]
@@ -9,6 +9,7 @@ shadowvpn-core = { path = "../shadowvpn-core" }
 eframe = "0.29"
 image = { version = "0.25", default-features = false, features = ["png"] }
 serde_json = "1"
+url = "2"
 
 [dev-dependencies]
 tempfile = "3"

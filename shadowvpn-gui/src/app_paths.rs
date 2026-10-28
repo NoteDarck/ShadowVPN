@@ -41,3 +41,13 @@ pub fn server_networks_path() -> PathBuf {
         .map(|base| base.join("shadowvpn").join("networks.json"))
         .unwrap_or_else(|| PathBuf::from("data").join("networks.json"))
 }
+
+pub fn server_admin_token_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("SHADOWVPN_ADMIN_TOKEN_FILE") {
+        return PathBuf::from(path);
+    }
+
+    data_dir()
+        .map(|base| base.join("shadowvpn").join("admin-token"))
+        .unwrap_or_else(|| PathBuf::from("data").join("admin-token"))
+}

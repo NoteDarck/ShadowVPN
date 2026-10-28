@@ -1,6 +1,6 @@
 # Como conectar no ShadowVPN
 
-Este guia cobre o fluxo da versão 0.4.2 em diante: primeiro alguém **cria a rede** no servidor, gera um **convite** e os outros computadores entram com o link e a senha. A rede fica salva mesmo quando todos desconectam ou o servidor reinicia.
+Este guia cobre o fluxo da versão 0.5.0 em diante: primeiro alguém **cria a rede** no servidor, gera um **convite** e os outros computadores entram com o link e a senha. A rede fica salva mesmo quando todos desconectam ou o servidor reinicia.
 
 ## O que você precisa
 
@@ -69,6 +69,14 @@ Para escolher outro arquivo de redes:
 SHADOWVPN_NETWORKS_FILE=/var/lib/shadowvpn/networks.json ./shadowvpn-server
 ```
 
+Para exigir token na criação e administração de redes, use um arquivo de token (criado com permissão `0600` se não existir):
+
+```bash
+SHADOWVPN_ADMIN_TOKEN_FILE=/var/lib/shadowvpn/admin-token ./shadowvpn-server
+```
+
+Sem token, qualquer pessoa que alcance a API pode criar redes. Use esse modo apenas em laboratório ou rede confiável.
+
 ### Windows
 
 1. Extraia o ZIP ou use o instalador.
@@ -84,6 +92,14 @@ Se a pasta atual não for gravável, defina um arquivo em local gravável:
 ```powershell
 $env:SHADOWVPN_NETWORKS_FILE = "$env:ProgramData\ShadowVPN\networks.json"
 .\shadowvpn-server.exe
+```
+
+Para exigir token na criação e administração de redes:
+
+```powershell
+$env:SHADOWVPN_ADMIN_TOKEN_FILE = "$env:ProgramData\ShadowVPN\admin-token"
+.\shadowvpn-server.exe
+Get-Content $env:SHADOWVPN_ADMIN_TOKEN_FILE
 ```
 
 Permita as portas `8080/tcp` e `8081/udp` no firewall do Windows e no provedor de nuvem.
@@ -111,9 +127,9 @@ Resposta esperada:
 
 ### Backup das redes
 
-O arquivo `data/networks.json` contém os nomes das redes e apenas os hashes Argon2 das senhas. Faça backup dele. Se o arquivo for apagado, as redes somem no próximo reinício e será necessário criá-las novamente.
+O arquivo `data/networks.json` contém os nomes das redes e apenas os hashes Argon2 das senhas. O arquivo `admin-token`, quando configurado, contém o token de administração. Faça backup dos dois em local seguro. Se o arquivo de redes for apagado, as redes somem no próximo reinício e será necessário criá-las novamente.
 
-No Linux, o arquivo é criado com permissão `0600`. Mantenha o servidor parado ao editar ou copiar o arquivo manualmente.
+No Linux, os arquivos são criados com permissão `0600`. Mantenha o servidor parado ao editar ou copiar o arquivo de redes manualmente.
 
 ## 2. Criar a rede
 
@@ -122,8 +138,8 @@ A rede precisa existir antes do primeiro `register`. Escolha uma das opções ab
 ### Pela GUI
 
 1. Abra o `shadowvpn-gui` como Administrador no Windows ou com privilégios no Linux/macOS.
-2. Na aba **Criar rede**, informe o nome e a senha.
-3. Confirme a senha e clique em **Criar rede**. O servidor fica em **Servidor avançado** e só precisa ser informado ao auto-hospedar.
+2. Na aba **Criar rede**, informe o nome, a senha e, se o servidor exigir, o token de administração.
+3. Confirme a senha e clique em **Criar rede**. O servidor fica em **Servidor avançado** e só precisa ser informado ao auto-hospedar. No servidor local iniciado pela GUI, o token é usado automaticamente.
 4. Quando aparecer a confirmação, use o cartão do convite e clique em copiar.
 5. Clique em **Entrar na rede** e envie o convite e a senha por canais separados.
 
@@ -146,20 +162,34 @@ Ele contém um convite por linha e é separado do `networks.json` usado pelo ser
 No primeiro computador:
 
 ```bash
-SHADOWVPN_SERVER=http://vpn.exemplo.com:8080 \
+SHADOWVPN_SERVER=https://vpn.exemplo.com \
+SHADOWVPN_ADMIN_TOKEN='COLE_O_TOKEN' \
+./shadowvpn-client create-network \
+  --name minha-rede --password 'uma-senha-forte'
+```
+
+O subcomando `create-network` cria a rede sem conectar e imprime o convite. Se a rede já existir, a criação falha com `409 Conflict`; nesse caso use o fluxo de entrada.
+
+O modo antigo também funciona:
+
+```bash
+SHADOWVPN_SERVER=https://vpn.exemplo.com \
 SHADOWVPN_GROUP=minha-rede \
 SHADOWVPN_PASSWORD='uma-senha-forte' \
+SHADOWVPN_ADMIN_TOKEN='COLE_O_TOKEN' \
 ./shadowvpn-client --create
 ```
 
-`--create` cria a rede e em seguida conecta este computador. O log mostra o convite gerado. Se a rede já existir, a criação falha com `409 Conflict`; nesse caso use o fluxo de entrada, sem `--create`. Se a rede for criada mas a interface TUN falhar por falta de privilégio, a rede continua salva no servidor; corrija a permissão e entre sem `--create`.
+`--create` cria a rede e em seguida conecta este computador. Se a criação funcionar mas o TUN falhar por falta de privilégio, a rede continua salva; corrija a permissão e entre sem `--create`.
+
+Se o servidor usar `SHADOWVPN_ADMIN_TOKEN_FILE`, passe `--admin-token-file /caminho/do/token` na CLI. A GUI aceita o token no campo **Token de administração**.
 
 ### Convite
 
 O convite tem este formato:
 
 ```text
-shadowvpn://join?server=http%3A%2F%2Fvpn.exemplo.com%3A8080&network=minha-rede
+shadowvpn://join?server=https%3A%2F%2Fvpn.exemplo.com&network=minha-rede
 ```
 
 - `server` é a URL da API de coordenação.
@@ -167,12 +197,13 @@ shadowvpn://join?server=http%3A%2F%2Fvpn.exemplo.com%3A8080&network=minha-rede
 - A senha **não** é incluída. Envie-a por outro canal.
 - O link não cria um serviço central: alguém continua responsável por hospedar o servidor.
 
-Na GUI, o convite aparece após a criação, pode ser copiado na tela da rede e fica salvo na aba **Minhas redes**. Na CLI, ele aparece no log do `--create`. A API `POST /networks` não retorna o convite; monte o link com a URL do servidor e o nome da rede.
+Na GUI, o convite aparece após a criação, pode ser copiado na tela da rede e fica salvo na aba **Minhas redes**. Na CLI, ele é impresso por `create-network` ou pelo `--create`. A API `POST /networks` não retorna o convite; monte o link com a URL do servidor e o nome da rede.
 
 ### Pela API HTTP
 
 ```bash
-curl -X POST http://vpn.exemplo.com:8080/networks \
+curl -X POST https://vpn.exemplo.com/networks \
+  -H "Authorization: Bearer COLE_O_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"group_name":"minha-rede","group_password":"uma-senha-forte"}'
 ```
@@ -186,15 +217,18 @@ Resposta esperada, HTTP 201:
 Erros comuns:
 
 - `400 Bad Request`: nome ou senha fora das regras.
+- `401 Unauthorized`: token ausente ou inválido.
 - `409 Conflict`: já existe uma rede com esse nome.
+- `429 Too Many Requests`: o servidor atingiu `SHADOWVPN_MAX_NETWORKS`.
 - `500 Internal Server Error`: falha ao gravar o arquivo de redes; verifique permissões e `SHADOWVPN_NETWORKS_FILE`.
+- `503 Service Unavailable`: administração não configurada no servidor; defina o token no servidor.
 
 ### Regras de nome e senha
 
 - Nome: até 64 caracteres, letras, números, `-` ou `_`.
 - Senha: entre 8 e 128 caracteres.
 - Não reutilize a senha de outros serviços.
-- A API não permite alterar a senha de uma rede existente. Para trocar a senha, pare o servidor, remova a rede do JSON e crie novamente.
+- A senha pode ser trocada com privilégio administrativo. A troca encerra todas as sessões da rede e os clientes precisam entrar novamente com a nova senha.
 
 ## 3. Entrar na rede
 
@@ -215,13 +249,13 @@ A identidade XEdDSA é derivada da chave WireGuard, criada automaticamente e sal
 ```bash
 SHADOWVPN_PASSWORD='uma-senha-forte' \
 ./shadowvpn-client \
-  --invite 'shadowvpn://join?server=http%3A%2F%2Fvpn.exemplo.com%3A8080&network=minha-rede'
+  --invite 'shadowvpn://join?server=https%3A%2F%2Fvpn.exemplo.com&network=minha-rede'
 ```
 
 Também é possível informar `--server` e `--group` manualmente:
 
 ```bash
-SHADOWVPN_SERVER=http://vpn.exemplo.com:8080 \
+SHADOWVPN_SERVER=https://vpn.exemplo.com \
 SHADOWVPN_GROUP=minha-rede \
 SHADOWVPN_PASSWORD='uma-senha-forte' \
 ./shadowvpn-client
@@ -279,19 +313,13 @@ Ou execute a GUI com `sudo`. Os binários não são assinados nem notarizados; s
 
 ## HTTPS e segurança
 
-A API usa HTTP simples por padrão. A senha da rede é enviada nas requisições; portanto, em redes não confiáveis, coloque a API atrás de HTTPS:
+A API usa HTTP simples por padrão. A senha da rede só é enviada no registro e o heartbeat usa um token de sessão, mas em redes não confiáveis coloque a API atrás de HTTPS. O guia completo com Docker Compose e Caddy está em [DEPLOY.md](DEPLOY.md).
 
-```caddyfile
-vpn.exemplo.com {
-    reverse_proxy 127.0.0.1:8080
-}
-```
-
-Mantenha `SHADOWVPN_LISTEN=127.0.0.1:8080` e configure `SHADOWVPN_RELAY_ADVERTISE=vpn.exemplo.com:8081`.
+Mantenha `SHADOWVPN_LISTEN=127.0.0.1:8080` e configure `SHADOWVPN_RELAY_ADVERTISE=vpn.exemplo.com:8081`. Proteja também o token administrativo: sem ele, qualquer pessoa que alcance `POST /networks` pode criar uma rede.
 
 O relay UDP transporta somente datagramas WireGuard cifrados. O servidor vê metadados (IPs públicos, sessões e volume), mas não o conteúdo dos pacotes. O registro inclui uma prova XEdDSA de posse da chave WireGuard; servidor e peers verificam essa prova antes de criar os túneis. O PSK pairwise é derivado pelas duas pontas e não é conhecido pelo servidor.
 
-Qualquer pessoa que alcance `POST /networks` pode criar uma rede nova. Use nomes difíceis de adivinhar e restrinja o acesso à API em ambientes públicos.
+Quando `SHADOWVPN_ADMIN_TOKEN` ou `SHADOWVPN_ADMIN_TOKEN_FILE` está configurado, criar, listar, excluir e trocar a senha de redes exige Bearer token. Sem token, a criação fica aberta e o servidor registra um aviso; restrinja a API em ambientes públicos e não há rate limiting por IP.
 
 ## Problemas comuns
 
@@ -299,16 +327,16 @@ Qualquer pessoa que alcance `POST /networks` pode criar uma rede nova. Use nomes
 
 - Confirme que o link começa com `shadowvpn://`.
 - O convite precisa incluir `server` e `network`.
-- Se você editou o link, codifique a URL do servidor corretamente, por exemplo `http%3A%2F%2Fvpn.exemplo.com%3A8080`.
+- Se você editou o link, codifique a URL do servidor corretamente, por exemplo `https%3A%2F%2Fvpn.exemplo.com`.
 - O link não contém a senha; informe-a no campo separado.
 
 ### "rede não encontrada; crie a rede primeiro"
 
-A rede ainda não existe no servidor. Crie-a na GUI/CLI com `--create`/`POST /networks` e tente entrar novamente.
+A rede ainda não existe no servidor. Crie-a na GUI, com `create-network`/`--create` ou com `POST /networks` e tente entrar novamente.
 
 ### "já existe uma rede com esse nome"
 
-A rede já foi criada. Não use `--create`; entre normalmente com o convite e a senha combinados. Se a senha estiver errada, a API não permite redefini-la: recrie a rede com o servidor parado.
+A rede já foi criada. Não use `create-network` nem `--create`; entre normalmente com o convite e a senha combinados. Se a senha estiver errada, peça ao administrador para usar `rotate-password` ou a rota administrativa correspondente.
 
 ### A aba "Minhas redes" está vazia
 
@@ -350,7 +378,7 @@ SHADOWVPN_RELAY_ADVERTISE=vpn.exemplo.com:8081 ./shadowvpn-server
 
 ### Reiniciei o servidor e a conexão caiu
 
-As redes são persistentes, mas as sessões não. O cliente tenta renovar o registro no próximo heartbeat; se o IP virtual mudar, reconecte. Se a rede tiver sido apagada do arquivo, crie-a novamente.
+As redes, os membros e os IPs virtuais são persistentes, mas as sessões ativas não. O cliente detecta a queda no heartbeat e reconecta com backoff; o IP virtual é mantido. Se a rede tiver sido apagada ou a senha alterada pelo administrador, o cliente mostra o erro e será necessário entrar novamente.
 
 ### O servidor não consegue salvar as redes
 
@@ -368,6 +396,12 @@ A chave de identidade daquele computador foi recriada. Confirme com o dono do pe
 
 O instalador e a GUI do Windows abrem no Wine, mas a conexão real não funciona: o Wintun exige um driver de kernel do Windows e falha no Wine. Para testar a VPN, use Windows nativo ou uma VM Windows.
 
+## Atualizando de 0.4.x para 0.5.x
+
+Atualize primeiro o servidor e depois os clientes. O servidor 0.5.x ainda aceita clientes 0.4.x pelo fallback de senha, mas o cliente 0.5.x exige servidor 0.5.x para usar o heartbeat por token.
+
+A identidade e as redes existentes continuam válidas. O `networks.json` v1 é migrado para v2 no primeiro registro, preservando os IPs virtuais a partir daí. Configure `SHADOWVPN_ADMIN_TOKEN` ou `SHADOWVPN_ADMIN_TOKEN_FILE` e use HTTPS conforme [DEPLOY.md](DEPLOY.md).
+
 ## Atualizando de 0.3.x para 0.4.x
 
 Atualize servidor, clientes e GUI juntos. O protocolo de registro agora exige prova XEdDSA e os peers usam um PSK pairwise; clientes 0.3.x não são compatíveis com servidores 0.4.x e vice-versa.
@@ -379,7 +413,7 @@ A chave `identity.key` existente continua válida e não é preciso recriar rede
 A versão 0.3.0 introduz a criação explícita de redes. Na primeira execução do servidor 0.3.0 não existe arquivo de redes, então:
 
 1. Atualize servidor, clientes e GUI para 0.3.0.
-2. Crie cada rede existente uma vez com `--create`, pela GUI ou por `POST /networks`.
+2. Crie cada rede existente uma vez com `create-network`, `--create`, pela GUI ou por `POST /networks`.
 3. Use o mesmo nome e a mesma senha que os clientes já conhecem.
 4. Entre normalmente nos clientes.
 

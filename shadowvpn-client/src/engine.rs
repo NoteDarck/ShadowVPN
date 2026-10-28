@@ -1,4 +1,4 @@
-use crate::api::Api;
+use crate::api::{Api, ApiError};
 use crate::config::ClientConfig;
 use crate::identity;
 use crate::tunnel::{self, TunFramed};
@@ -7,21 +7,41 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 use futures::{SinkExt, StreamExt};
+use reqwest::StatusCode;
 use shadowvpn_core::{
     encode_relay_packet, parse_relay_packet, valid_public_key, PeerIdentity, PeerInfo,
-    RegisterResponse, RelayKind, HEARTBEAT_SECS, RELAY_HEADER_LEN, VIRTUAL_NETWORK_PREFIX,
+    PeersResponse, RelayKind, HEARTBEAT_SECS, RELAY_HEADER_LEN, VIRTUAL_NETWORK_PREFIX,
 };
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
-use tokio::time::{interval, interval_at, Instant, MissedTickBehavior};
+use tokio::time::{interval, interval_at, sleep, Instant, MissedTickBehavior};
 
 const PACKET_BUFFER: usize = 65_536;
 const TIMER_INTERVAL: Duration = Duration::from_millis(250);
 const WIREGUARD_KEEPALIVE_SECS: u16 = 25;
+const HEARTBEAT_FAILURES_BEFORE_RECONNECT: u32 = 3;
+const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(1);
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
+
+#[derive(Debug)]
+struct FatalConnectError(anyhow::Error);
+
+impl fmt::Display for FatalConnectError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for FatalConnectError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum ClientEvent {
@@ -37,6 +57,11 @@ pub enum ClientEvent {
     Peers(Vec<PeerInfo>),
     Latency(u64),
     Status(String),
+    Reconnecting {
+        attempt: u32,
+        delay_secs: u64,
+        message: String,
+    },
     Error(String),
     Finished,
 }
@@ -134,129 +159,240 @@ pub async fn run(
     let identity_fingerprint =
         shadowvpn_crypto::verify_peer_identity(&public_key, &config.group_name, &identity_proof)?;
     let hostname = local_hostname();
-
     let api = Api::new(&config.server)?;
+    let mut attempt = 0u32;
 
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+
+        match connect_once(
+            &config,
+            &api,
+            &secret,
+            &public_key,
+            &identity_proof,
+            &identity_fingerprint,
+            &hostname,
+            &shutdown,
+            &events,
+            &mut attempt,
+        )
+        .await
+        {
+            Ok(()) => break,
+            Err(error) if is_fatal_error(&error) => return Err(error),
+            Err(error) => {
+                if *shutdown.borrow() {
+                    break;
+                }
+
+                attempt = attempt.saturating_add(1);
+                let delay = reconnect_delay(attempt);
+                let message = format!("{error:#}");
+                tracing::warn!(
+                    attempt,
+                    delay_secs = delay.as_secs(),
+                    error = %message,
+                    "conexão caiu; tentando novamente"
+                );
+                emit(&events, ClientEvent::Peers(Vec::new()));
+                emit(
+                    &events,
+                    ClientEvent::Reconnecting {
+                        attempt,
+                        delay_secs: delay.as_secs().max(1),
+                        message,
+                    },
+                );
+
+                let mut wait_for_shutdown = shutdown.clone();
+                tokio::select! {
+                    _ = sleep(delay) => {}
+                    _ = wait_for_shutdown.changed() => {}
+                }
+            }
+        }
+    }
+
+    emit(&events, ClientEvent::Status("Desconectado".into()));
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn connect_once(
+    config: &ClientConfig,
+    api: &Api,
+    secret: &StaticSecret,
+    public_key: &str,
+    identity_proof: &PeerIdentity,
+    identity_fingerprint: &str,
+    hostname: &str,
+    shutdown: &watch::Receiver<bool>,
+    events: &Option<Sender<ClientEvent>>,
+    attempt: &mut u32,
+) -> Result<()> {
     emit(
-        &events,
+        events,
         ClientEvent::Status("Registrando no grupo...".into()),
     );
     let register_started = std::time::Instant::now();
-    let registered = api
+    let registered = match api
         .register(
             &config.group_name,
             &config.group_password,
-            &public_key,
-            &identity_proof,
-            &hostname,
+            public_key,
+            identity_proof,
+            hostname,
         )
-        .await?;
+        .await
+    {
+        Ok(registered) => registered,
+        Err(error) if api_status(&error) == Some(StatusCode::NOT_FOUND) => {
+            return Err(anyhow::Error::new(FatalConnectError(error)));
+        }
+        Err(error) => return Err(error),
+    };
+    *attempt = 0;
     let register_latency_ms = register_started.elapsed().as_millis() as u64;
+    let own_session = registered.session_id;
+    let session_token = registered.session_token.clone();
 
-    let own_ip: Ipv4Addr = registered
-        .virtual_ip
-        .parse()
-        .with_context(|| format!("IP virtual inválido: {}", registered.virtual_ip))?;
+    let own_ip: Ipv4Addr = match registered.virtual_ip.parse() {
+        Ok(address) => address,
+        Err(error) => {
+            cleanup_registration(api, &config.group_name, &session_token, own_session).await;
+            return Err(anyhow::Error::new(FatalConnectError(anyhow::anyhow!(
+                "IP virtual inválido {}: {error}",
+                registered.virtual_ip
+            ))));
+        }
+    };
     let relay = match resolve_relay(&registered.relay).await {
         Ok(relay) => relay,
         Err(error) => {
-            cleanup_registration(&api, &config, registered.session_id).await;
+            cleanup_registration(api, &config.group_name, &session_token, own_session).await;
             return Err(error);
         }
     };
-    let mut own_session = registered.session_id;
 
     let framed = match tunnel::create(own_ip) {
         Ok(framed) => framed,
         Err(error) => {
-            cleanup_registration(&api, &config, own_session).await;
-            return Err(error);
+            cleanup_registration(api, &config.group_name, &session_token, own_session).await;
+            return Err(anyhow::Error::new(FatalConnectError(error)));
         }
     };
 
     let udp = match bind_udp(relay).await {
         Ok(udp) => udp,
         Err(error) => {
-            cleanup_registration(&api, &config, own_session).await;
+            cleanup_registration(api, &config.group_name, &session_token, own_session).await;
             return Err(error);
         }
     };
     let mut peers = PeerSet::default();
-    let peer_list = peers.reconcile(&registered.peers, &secret, &config.group_name);
+    let peer_list = peers.reconcile(&registered.peers, secret, &config.group_name);
     if let Err(error) = send_hello(&udp, relay, own_session).await {
-        cleanup_registration(&api, &config, own_session).await;
+        cleanup_registration(api, &config.group_name, &session_token, own_session).await;
         return Err(error);
     }
 
     emit(
-        &events,
+        events,
         ClientEvent::Registered {
-            hostname: hostname.clone(),
+            hostname: hostname.to_string(),
             virtual_ip: own_ip.to_string(),
             relay: relay.to_string(),
-            public_key: public_key.clone(),
-            identity_fingerprint,
+            public_key: public_key.to_string(),
+            identity_fingerprint: identity_fingerprint.to_string(),
             latency_ms: register_latency_ms,
             peers: peer_list.clone(),
         },
     );
-    emit(&events, ClientEvent::Peers(peer_list));
+    emit(events, ClientEvent::Peers(peer_list));
 
     tracing::info!(%own_ip, %relay, peers = peers.len(), "ShadowVPN conectado");
 
     let result = session_loop(
         &udp,
         relay,
-        own_ip,
-        &secret,
-        &mut own_session,
+        secret,
+        &session_token,
+        own_session,
         framed,
         &mut peers,
-        &shutdown,
-        &events,
-        &api,
-        &config,
-        &public_key,
-        &identity_proof,
-        &hostname,
+        shutdown,
+        events,
+        api,
+        &config.group_name,
     )
     .await;
 
-    emit(&events, ClientEvent::Status("Desconectando...".into()));
-    cleanup_registration(&api, &config, own_session).await;
+    emit(events, ClientEvent::Status("Desconectando...".into()));
+    cleanup_registration(api, &config.group_name, &session_token, own_session).await;
 
     tracing::info!("ShadowVPN desconectado");
     result
+}
+
+fn reconnect_delay(attempt: u32) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(5);
+    let millis = RECONNECT_BASE_DELAY
+        .as_millis()
+        .saturating_mul(1u128 << exponent);
+    let capped = millis.min(RECONNECT_MAX_DELAY.as_millis());
+    Duration::from_millis(capped as u64)
+}
+
+fn api_status(error: &anyhow::Error) -> Option<StatusCode> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<ApiError>()
+            .map(|api_error| api_error.status)
+    })
+}
+
+fn is_fatal_error(error: &anyhow::Error) -> bool {
+    if error.chain().any(|cause| cause.is::<FatalConnectError>()) {
+        return true;
+    }
+    matches!(
+        api_status(error),
+        Some(
+            StatusCode::BAD_REQUEST
+                | StatusCode::UNAUTHORIZED
+                | StatusCode::FORBIDDEN
+                | StatusCode::NOT_FOUND
+        )
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn session_loop(
     udp: &UdpSocket,
     relay: SocketAddr,
-    own_ip: Ipv4Addr,
     secret: &StaticSecret,
-    own_session: &mut u64,
+    session_token: &str,
+    own_session: u64,
     mut framed: TunFramed,
     peers: &mut PeerSet,
     shutdown: &watch::Receiver<bool>,
     events: &Option<Sender<ClientEvent>>,
     api: &Api,
-    config: &ClientConfig,
-    public_key: &str,
-    identity_proof: &PeerIdentity,
-    hostname: &str,
+    group_name: &str,
 ) -> Result<()> {
     let mut udp_buffer = vec![0u8; PACKET_BUFFER];
     let mut timer = interval(TIMER_INTERVAL);
     timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     let (heartbeat_tx, mut heartbeat_rx) =
-        tokio::sync::mpsc::channel::<(u64, anyhow::Result<RegisterResponse>)>(1);
+        tokio::sync::mpsc::channel::<(u64, anyhow::Result<PeersResponse>)>(1);
     let heartbeat_api = api.clone();
-    let heartbeat_config = config.clone();
-    let heartbeat_public_key = public_key.to_string();
-    let heartbeat_identity = identity_proof.clone();
-    let heartbeat_hostname = hostname.to_string();
+    let heartbeat_group = group_name.to_string();
+    let heartbeat_token = session_token.to_string();
+    let heartbeat_session = own_session;
     let mut heartbeat_tasks = tokio::task::JoinSet::new();
     heartbeat_tasks.spawn(async move {
         let period = Duration::from_secs(HEARTBEAT_SECS);
@@ -266,13 +402,7 @@ async fn session_loop(
             ticker.tick().await;
             let started = std::time::Instant::now();
             let result = heartbeat_api
-                .register(
-                    &heartbeat_config.group_name,
-                    &heartbeat_config.group_password,
-                    &heartbeat_public_key,
-                    &heartbeat_identity,
-                    &heartbeat_hostname,
-                )
+                .heartbeat(&heartbeat_group, &heartbeat_token, heartbeat_session)
                 .await;
             let latency_ms = started.elapsed().as_millis() as u64;
             if heartbeat_tx.send((latency_ms, result)).await.is_err() {
@@ -280,6 +410,8 @@ async fn session_loop(
             }
         }
     });
+
+    let mut failed_heartbeats = 0u32;
 
     loop {
         if *shutdown.borrow() {
@@ -299,7 +431,7 @@ async fn session_loop(
                     peers,
                     udp,
                     relay,
-                    *own_session,
+                    own_session,
                 ).await?;
             }
             received = udp.recv_from(&mut udp_buffer) => {
@@ -314,7 +446,7 @@ async fn session_loop(
                     &mut framed,
                     udp,
                     relay,
-                    *own_session,
+                    own_session,
                 ).await?;
             }
             _ = timer.tick() => {
@@ -323,7 +455,7 @@ async fn session_loop(
                     send_relay(
                         udp,
                         relay,
-                        *own_session,
+                        own_session,
                         destination,
                         RelayKind::Data,
                         &payload,
@@ -336,24 +468,32 @@ async fn session_loop(
                 };
                 match result {
                     Ok(response) => {
+                        failed_heartbeats = 0;
                         emit(events, ClientEvent::Latency(latency_ms));
-                        if response.virtual_ip != own_ip.to_string() {
-                            bail!("o servidor atribuiu um novo IP virtual; reconecte");
-                        }
-                        if response.session_id != *own_session {
-                            *own_session = response.session_id;
-                        }
                         let refreshed =
-                            peers.reconcile(&response.peers, secret, &config.group_name);
+                            peers.reconcile(&response.peers, secret, group_name);
                         emit(events, ClientEvent::Peers(refreshed));
-                        send_hello(udp, relay, *own_session).await?;
+                        send_hello(udp, relay, own_session).await?;
                         tracing::debug!(peers = peers.len(), "heartbeat enviado");
                     }
                     Err(error) => {
-                        tracing::warn!(%error, "falha no heartbeat; mantendo túnel");
+                        failed_heartbeats = failed_heartbeats.saturating_add(1);
+                        if api_status(&error) == Some(StatusCode::NOT_FOUND) {
+                            bail!("sessão expirou no servidor; reconectando");
+                        }
+                        tracing::warn!(
+                            failed_heartbeats,
+                            %error,
+                            "falha no heartbeat"
+                        );
+                        if failed_heartbeats >= HEARTBEAT_FAILURES_BEFORE_RECONNECT {
+                            return Err(error).context("heartbeat falhou repetidamente");
+                        }
                         emit(
                             events,
-                            ClientEvent::Status(format!("Falha no heartbeat: {error:#}")),
+                            ClientEvent::Status(format!(
+                                "Falha no heartbeat ({failed_heartbeats}/{HEARTBEAT_FAILURES_BEFORE_RECONNECT}): {error:#}"
+                            )),
                         );
                     }
                 }
@@ -528,11 +668,8 @@ async fn send_relay(
     Ok(())
 }
 
-async fn cleanup_registration(api: &Api, config: &ClientConfig, session_id: u64) {
-    if let Err(error) = api
-        .unregister(&config.group_name, &config.group_password, session_id)
-        .await
-    {
+async fn cleanup_registration(api: &Api, group_name: &str, session_token: &str, session_id: u64) {
+    if let Err(error) = api.unregister(group_name, session_token, session_id).await {
         tracing::debug!(%error, "não foi possível remover o peer no servidor");
     }
 }
@@ -778,6 +915,35 @@ mod tests {
     use super::*;
 
     const TEST_GROUP: &str = "rede-teste";
+
+    #[test]
+    fn classifies_fatal_and_retryable_connect_errors() {
+        let unauthorized: anyhow::Error = ApiError {
+            status: StatusCode::UNAUTHORIZED,
+            message: "senha inválida".into(),
+        }
+        .into();
+        assert!(is_fatal_error(&unauthorized));
+
+        let unavailable: anyhow::Error = ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "indisponível".into(),
+        }
+        .into();
+        assert!(!is_fatal_error(&unavailable));
+
+        let tun = anyhow::Error::new(FatalConnectError(anyhow::anyhow!("sem TUN")));
+        assert!(is_fatal_error(&tun));
+    }
+
+    #[test]
+    fn reconnect_backoff_is_capped() {
+        assert_eq!(reconnect_delay(1), Duration::from_secs(1));
+        assert_eq!(reconnect_delay(2), Duration::from_secs(2));
+        assert_eq!(reconnect_delay(3), Duration::from_secs(4));
+        assert_eq!(reconnect_delay(6), Duration::from_secs(30));
+        assert_eq!(reconnect_delay(100), Duration::from_secs(30));
+    }
 
     fn peer_info(
         secret: &StaticSecret,

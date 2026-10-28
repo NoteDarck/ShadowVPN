@@ -164,10 +164,12 @@ impl LocalServer {
         }
 
         let log_path = networks_file.with_file_name("server.log");
+        let admin_token_file = app_paths::server_admin_token_path();
         let mut command = Command::new(&executable);
         command
             .stdin(Stdio::null())
-            .env("SHADOWVPN_NETWORKS_FILE", &networks_file);
+            .env("SHADOWVPN_NETWORKS_FILE", &networks_file)
+            .env("SHADOWVPN_ADMIN_TOKEN_FILE", &admin_token_file);
         if let Ok(log) = open_log(&log_path) {
             if let Ok(errors) = log.try_clone() {
                 command.stdout(Stdio::from(log)).stderr(Stdio::from(errors));
@@ -228,15 +230,23 @@ pub fn is_loopback_url(value: &str) -> bool {
     if value.is_empty() {
         return true;
     }
-    let value = value
-        .strip_prefix("http://")
-        .or_else(|| value.strip_prefix("https://"))
-        .unwrap_or(value);
-    let host = value.split('/').next().unwrap_or(value);
-    host.starts_with("127.")
-        || host.starts_with("localhost")
-        || host.starts_with("[::1]")
-        || host.starts_with("0.0.0.0")
+    let candidate = if value.contains("://") {
+        value.to_string()
+    } else {
+        format!("http://{value}")
+    };
+    let Ok(url) = url::Url::parse(&candidate) else {
+        return false;
+    };
+    match url.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback() || address.is_unspecified(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback() || address.is_unspecified(),
+        Some(url::Host::Domain(host)) => {
+            let host = host.trim_end_matches('.').to_ascii_lowercase();
+            host == "localhost" || host.ends_with(".localhost")
+        }
+        None => false,
+    }
 }
 
 fn server_executable() -> PathBuf {
@@ -313,6 +323,12 @@ pub fn local_invite_server_url() -> String {
     format!("http://{host}:{}", listen.port())
 }
 
+pub fn local_admin_token() -> Option<String> {
+    let path = app_paths::server_admin_token_path();
+    let token = fs::read_to_string(path).ok()?.trim().to_string();
+    (!token.is_empty()).then_some(token)
+}
+
 pub fn local_network_names() -> Result<Vec<String>, String> {
     let path = app_paths::server_networks_path();
     let content = match fs::read_to_string(&path) {
@@ -378,8 +394,12 @@ mod tests {
         assert!(is_loopback_url("http://127.0.0.1:8080"));
         assert!(is_loopback_url("http://localhost:8080/"));
         assert!(is_loopback_url("https://[::1]:8080"));
+        assert!(is_loopback_url("http://127.1.2.3:8080"));
+        assert!(is_loopback_url("http://painel.localhost:8080"));
         assert!(!is_loopback_url("http://192.168.1.10:8080"));
         assert!(!is_loopback_url("https://vpn.example.com"));
+        assert!(!is_loopback_url("http://127.evil.example:8080"));
+        assert!(!is_loopback_url("http://localhost.evil.example:8080"));
     }
 
     #[test]

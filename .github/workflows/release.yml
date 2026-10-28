@@ -96,7 +96,7 @@ jobs:
              target/release/shadowvpn-gui \
              README.md \
              "$dir/"
-          cp -R assets docs "$dir/"
+          cp -R assets docs deploy "$dir/"
           chmod +x "$dir"/shadowvpn-*
           archive="${dir}.tar.gz"
           tar -czf "$archive" "$dir"
@@ -181,6 +181,7 @@ jobs:
           Copy-Item README.md $dir
           Copy-Item assets $dir -Recurse
           Copy-Item docs $dir -Recurse
+          Copy-Item deploy $dir -Recurse
 
           $expected = '07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51'
           $zip = Join-Path $env:RUNNER_TEMP 'wintun.zip'

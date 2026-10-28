@@ -131,6 +131,23 @@ pub struct CreateNetworkResponse {
     pub group_name: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkSummary {
+    pub name: String,
+    pub online_peers: usize,
+    pub known_peers: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkListResponse {
+    pub networks: Vec<NetworkSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RotatePasswordRequest {
+    pub new_password: String,
+}
+
 /// Requisição para entrar em um grupo.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RegisterRequest {
@@ -152,6 +169,9 @@ pub struct RegisterResponse {
     pub virtual_ip: String,
     /// Identificador opaco usado no relay UDP.
     pub session_id: u64,
+    /// Segredo da sessão para heartbeat e desconexão sem reenviar a senha.
+    #[serde(default)]
+    pub session_token: String,
     /// Endereço do relay UDP (ex.: "vpn.example.com:8081").
     pub relay: String,
     /// Outros peers ativos no mesmo grupo.
@@ -175,8 +195,13 @@ pub struct PeerInfo {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PeersRequest {
     pub group_name: String,
+    /// Mantido para compatibilidade com clientes antigos.
+    #[serde(default)]
     pub group_password: String,
     pub session_id: u64,
+    /// Preferido: autentica a sessão sem reenviar a senha da rede.
+    #[serde(default)]
+    pub session_token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,8 +213,13 @@ pub struct PeersResponse {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct UnregisterRequest {
     pub group_name: String,
+    /// Mantido para compatibilidade com clientes antigos.
+    #[serde(default)]
     pub group_password: String,
     pub session_id: u64,
+    /// Preferido: autentica a sessão sem reenviar a senha da rede.
+    #[serde(default)]
+    pub session_token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

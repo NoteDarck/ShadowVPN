@@ -1,0 +1,19 @@
+{$SHADOWVPN_DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	reverse_proxy server:8080 {
+		header_up X-Forwarded-Proto https
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

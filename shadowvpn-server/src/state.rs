@@ -13,10 +13,13 @@ use argon2::{
 use rand_core::{OsRng as SessionOsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use shadowvpn_core::{
-    clean_hostname, valid_group_name, PeerIdentity, PeerInfo, VIRTUAL_NETWORK_PREFIX,
+    clean_hostname, valid_group_name, NetworkSummary, PeerIdentity, PeerInfo,
+    VIRTUAL_NETWORK_PREFIX,
 };
 
-const NETWORKS_FILE_VERSION: u32 = 1;
+const NETWORKS_FILE_VERSION: u32 = 2;
+const LEGACY_NETWORKS_FILE_VERSION: u32 = 1;
+const DEFAULT_MAX_NETWORKS: usize = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateError {
@@ -25,6 +28,7 @@ pub enum StateError {
     NetworkNotFound,
     NetworkExists,
     GroupFull,
+    ServerFull,
     SessionNotFound,
     Internal,
 }
@@ -33,6 +37,7 @@ pub enum StateError {
 pub struct RegisterOutcome {
     pub virtual_ip: Ipv4Addr,
     pub session_id: u64,
+    pub session_token: String,
     pub peers: Vec<PeerInfo>,
 }
 
@@ -43,6 +48,8 @@ pub struct AppState {
     relay_port: u16,
     relay_advertise: Option<String>,
     networks_file: Option<PathBuf>,
+    admin_token: Option<String>,
+    max_networks: usize,
 }
 
 struct ServerInner {
@@ -59,17 +66,21 @@ struct NetworksFile {
 #[derive(Serialize, Deserialize)]
 struct StoredNetwork {
     password_hash: String,
+    #[serde(default)]
+    members: BTreeMap<String, String>,
 }
 
 #[derive(Clone)]
 struct SessionRef {
     group: String,
     public_key: String,
+    token: String,
 }
 
 struct Group {
     password_hash: String,
     peers: HashMap<String, Peer>,
+    members: BTreeMap<String, Ipv4Addr>,
 }
 
 struct Peer {
@@ -95,6 +106,8 @@ impl AppState {
             relay_port,
             relay_advertise,
             networks_file: None,
+            admin_token: None,
+            max_networks: DEFAULT_MAX_NETWORKS,
         }
     }
 
@@ -114,21 +127,50 @@ impl AppState {
             relay_port,
             relay_advertise,
             networks_file: Some(networks_file),
+            admin_token: None,
+            max_networks: DEFAULT_MAX_NETWORKS,
         })
     }
 
+    pub fn with_admin_token(mut self, admin_token: Option<String>) -> Self {
+        self.admin_token = admin_token;
+        self
+    }
+
+    pub fn with_max_networks(mut self, max_networks: usize) -> Self {
+        self.max_networks = max_networks.max(1);
+        self
+    }
+
+    pub fn admin_token(&self) -> Option<&str> {
+        self.admin_token.as_deref()
+    }
+
     pub fn create_network(&self, group_name: &str, password: &str) -> Result<(), StateError> {
+        {
+            let inner = self.lock();
+            if inner.groups.contains_key(group_name) {
+                return Err(StateError::NetworkExists);
+            }
+            if inner.groups.len() >= self.max_networks {
+                return Err(StateError::ServerFull);
+            }
+        }
+
+        let password_hash = hash_password(password).ok_or(StateError::Internal)?;
         let mut inner = self.lock();
         if inner.groups.contains_key(group_name) {
             return Err(StateError::NetworkExists);
         }
-
-        let password_hash = hash_password(password).ok_or(StateError::Internal)?;
+        if inner.groups.len() >= self.max_networks {
+            return Err(StateError::ServerFull);
+        }
         inner.groups.insert(
             group_name.to_owned(),
             Group {
                 password_hash,
                 peers: HashMap::new(),
+                members: BTreeMap::new(),
             },
         );
 
@@ -172,72 +214,130 @@ impl AppState {
         let fingerprint = shadowvpn_crypto::verify_peer_identity(public_key, group_name, identity)
             .map_err(|_| StateError::InvalidIdentity)?;
         let now = Instant::now();
-        let mut inner = self.lock();
-        inner.prune(now, self.peer_ttl);
 
-        let ServerInner { groups, sessions } = &mut *inner;
-
-        let group = groups
-            .get_mut(group_name)
-            .ok_or(StateError::NetworkNotFound)?;
-        if !verify_password(&group.password_hash, password) {
+        let password_hash = {
+            let mut inner = self.lock();
+            inner.prune(now, self.peer_ttl);
+            inner
+                .groups
+                .get(group_name)
+                .map(|group| group.password_hash.clone())
+                .ok_or(StateError::NetworkNotFound)?
+        };
+        if !verify_password(&password_hash, password) {
             return Err(StateError::InvalidCredentials);
         }
 
-        let existing = group
-            .peers
-            .get(public_key)
-            .map(|peer| (peer.session_id, peer.virtual_ip));
-
         let hostname = display_hostname(hostname);
-        let (session_id, virtual_ip) = if let Some((session_id, virtual_ip)) = existing {
-            if let Some(peer) = group.peers.get_mut(public_key) {
-                peer.last_seen = now;
-                peer.hostname = hostname;
-                peer.identity = identity.clone();
-                peer.fingerprint = fingerprint.clone();
+        let mut inner = self.lock();
+        inner.prune(now, self.peer_ttl);
+
+        let (session_id, virtual_ip, session_token, peers, new_member) = {
+            let ServerInner { groups, sessions } = &mut *inner;
+            let group = groups
+                .get_mut(group_name)
+                .ok_or(StateError::NetworkNotFound)?;
+            if group.password_hash != password_hash {
+                return Err(StateError::InvalidCredentials);
             }
-            sessions.entry(session_id).or_insert_with(|| SessionRef {
-                group: group_name.to_owned(),
-                public_key: public_key.to_owned(),
-            });
-            (session_id, virtual_ip)
-        } else {
-            let virtual_ip = allocate_ip(group).ok_or(StateError::GroupFull)?;
-            let session_id = new_session_id(sessions);
-            group.peers.insert(
-                public_key.to_owned(),
-                Peer {
-                    public_key: public_key.to_owned(),
-                    identity: identity.clone(),
-                    fingerprint,
-                    hostname,
-                    virtual_ip,
-                    session_id,
-                    last_seen: now,
-                    relay_addr: None,
-                },
-            );
-            sessions.insert(
-                session_id,
-                SessionRef {
-                    group: group_name.to_owned(),
-                    public_key: public_key.to_owned(),
-                },
-            );
-            (session_id, virtual_ip)
+
+            let existing = group
+                .peers
+                .get(public_key)
+                .map(|peer| (peer.session_id, peer.virtual_ip));
+
+            let (session_id, virtual_ip, session_token, new_member) =
+                if let Some((session_id, virtual_ip)) = existing {
+                    if let Some(peer) = group.peers.get_mut(public_key) {
+                        peer.last_seen = now;
+                        peer.hostname = hostname;
+                        peer.identity = identity.clone();
+                        peer.fingerprint = fingerprint;
+                    }
+                    let token = match sessions.get(&session_id) {
+                        Some(session) => session.token.clone(),
+                        None => {
+                            let token = new_session_token();
+                            sessions.insert(
+                                session_id,
+                                SessionRef {
+                                    group: group_name.to_owned(),
+                                    public_key: public_key.to_owned(),
+                                    token: token.clone(),
+                                },
+                            );
+                            token
+                        }
+                    };
+                    (session_id, virtual_ip, token, false)
+                } else {
+                    let (virtual_ip, new_member) =
+                        if let Some(address) = group.members.get(public_key).copied() {
+                            (address, false)
+                        } else {
+                            let address = allocate_ip(group).ok_or(StateError::GroupFull)?;
+                            group.members.insert(public_key.to_owned(), address);
+                            (address, true)
+                        };
+                    let session_id = new_session_id(sessions);
+                    let token = new_session_token();
+                    group.peers.insert(
+                        public_key.to_owned(),
+                        Peer {
+                            public_key: public_key.to_owned(),
+                            identity: identity.clone(),
+                            fingerprint,
+                            hostname,
+                            virtual_ip,
+                            session_id,
+                            last_seen: now,
+                            relay_addr: None,
+                        },
+                    );
+                    sessions.insert(
+                        session_id,
+                        SessionRef {
+                            group: group_name.to_owned(),
+                            public_key: public_key.to_owned(),
+                            token: token.clone(),
+                        },
+                    );
+                    (session_id, virtual_ip, token, new_member)
+                };
+
+            let peers = group
+                .peers
+                .values()
+                .filter(|peer| peer.public_key != public_key)
+                .map(peer_info)
+                .collect();
+
+            (session_id, virtual_ip, session_token, peers, new_member)
         };
 
-        let peers = group
-            .peers
-            .values()
-            .filter(|peer| peer.public_key != public_key)
-            .map(peer_info)
-            .collect();
+        if new_member {
+            if let Some(path) = &self.networks_file {
+                if let Err(error) = save_networks(path, &inner.groups) {
+                    tracing::error!(
+                        %group_name,
+                        path = %path.display(),
+                        error = %error,
+                        "não foi possível persistir o IP virtual do novo membro"
+                    );
+                    if let Some(group) = inner.groups.get_mut(group_name) {
+                        group.peers.remove(public_key);
+                        group.members.remove(public_key);
+                    }
+                    inner.sessions.remove(&session_id);
+                    return Err(StateError::Internal);
+                }
+            }
+        }
 
         Ok(RegisterOutcome {
             virtual_ip,
             session_id,
+            session_token,
             peers,
         })
     }
@@ -249,22 +349,57 @@ impl AppState {
         session_id: u64,
     ) -> Result<Vec<PeerInfo>, StateError> {
         let now = Instant::now();
+        let password_hash = {
+            let mut inner = self.lock();
+            inner.prune(now, self.peer_ttl);
+            inner
+                .groups
+                .get(group_name)
+                .map(|group| group.password_hash.clone())
+                .ok_or(StateError::NetworkNotFound)?
+        };
+        if !verify_password(&password_hash, password) {
+            return Err(StateError::InvalidCredentials);
+        }
+
         let mut inner = self.lock();
         inner.prune(now, self.peer_ttl);
+        let group = inner
+            .groups
+            .get_mut(group_name)
+            .ok_or(StateError::NetworkNotFound)?;
+        if group.password_hash != password_hash {
+            return Err(StateError::InvalidCredentials);
+        }
+        touch_session(group, session_id, now)
+    }
+
+    pub fn heartbeat_with_token(
+        &self,
+        group_name: &str,
+        session_token: &str,
+        session_id: u64,
+    ) -> Result<Vec<PeerInfo>, StateError> {
+        let now = Instant::now();
+        let mut inner = self.lock();
+        inner.prune(now, self.peer_ttl);
+
+        let session = inner
+            .sessions
+            .get(&session_id)
+            .cloned()
+            .ok_or(StateError::SessionNotFound)?;
+        if session.group != group_name || !secure_eq(&session.token, session_token) {
+            return Err(StateError::SessionNotFound);
+        }
 
         let group = inner
             .groups
             .get_mut(group_name)
             .ok_or(StateError::NetworkNotFound)?;
-
-        if !verify_password(&group.password_hash, password) {
-            return Err(StateError::InvalidCredentials);
-        }
-
         let peer = group
             .peers
-            .values_mut()
-            .find(|peer| peer.session_id == session_id)
+            .get_mut(&session.public_key)
             .ok_or(StateError::SessionNotFound)?;
         peer.last_seen = now;
 
@@ -282,14 +417,26 @@ impl AppState {
         password: &str,
         session_id: u64,
     ) -> Result<(), StateError> {
+        let now = Instant::now();
+        let password_hash = {
+            let mut inner = self.lock();
+            inner.prune(now, self.peer_ttl);
+            inner
+                .groups
+                .get(group_name)
+                .map(|group| group.password_hash.clone())
+                .ok_or(StateError::NetworkNotFound)?
+        };
+        if !verify_password(&password_hash, password) {
+            return Err(StateError::InvalidCredentials);
+        }
+
         let mut inner = self.lock();
         let ServerInner { groups, sessions } = &mut *inner;
-
         let group = groups
             .get_mut(group_name)
             .ok_or(StateError::NetworkNotFound)?;
-
-        if !verify_password(&group.password_hash, password) {
+        if group.password_hash != password_hash {
             return Err(StateError::InvalidCredentials);
         }
 
@@ -302,6 +449,119 @@ impl AppState {
 
         group.peers.remove(&public_key);
         sessions.remove(&session_id);
+        Ok(())
+    }
+
+    pub fn unregister_with_token(
+        &self,
+        group_name: &str,
+        session_token: &str,
+        session_id: u64,
+    ) -> Result<(), StateError> {
+        let now = Instant::now();
+        let mut inner = self.lock();
+        inner.prune(now, self.peer_ttl);
+
+        let session = inner
+            .sessions
+            .get(&session_id)
+            .cloned()
+            .ok_or(StateError::SessionNotFound)?;
+        if session.group != group_name || !secure_eq(&session.token, session_token) {
+            return Err(StateError::SessionNotFound);
+        }
+
+        let ServerInner { groups, sessions } = &mut *inner;
+        if let Some(group) = groups.get_mut(group_name) {
+            group.peers.remove(&session.public_key);
+        }
+        sessions.remove(&session_id);
+        Ok(())
+    }
+
+    pub fn list_networks(&self) -> Vec<NetworkSummary> {
+        let now = Instant::now();
+        let mut inner = self.lock();
+        inner.prune(now, self.peer_ttl);
+
+        let mut networks: Vec<NetworkSummary> = inner
+            .groups
+            .iter()
+            .map(|(name, group)| NetworkSummary {
+                name: name.clone(),
+                online_peers: group.peers.len(),
+                known_peers: group.members.len(),
+            })
+            .collect();
+        networks.sort_by(|left, right| left.name.cmp(&right.name));
+        networks
+    }
+
+    pub fn delete_network(&self, group_name: &str) -> Result<(), StateError> {
+        let mut inner = self.lock();
+        let group = inner
+            .groups
+            .remove(group_name)
+            .ok_or(StateError::NetworkNotFound)?;
+
+        if let Some(path) = &self.networks_file {
+            if let Err(error) = save_networks(path, &inner.groups) {
+                inner.groups.insert(group_name.to_owned(), group);
+                tracing::error!(
+                    %group_name,
+                    path = %path.display(),
+                    error = %error,
+                    "não foi possível persistir a remoção da rede"
+                );
+                return Err(StateError::Internal);
+            }
+        }
+
+        inner
+            .sessions
+            .retain(|_, session| session.group != group_name);
+        tracing::info!(%group_name, "rede removida");
+        Ok(())
+    }
+
+    pub fn set_network_password(&self, group_name: &str, password: &str) -> Result<(), StateError> {
+        {
+            let inner = self.lock();
+            if !inner.groups.contains_key(group_name) {
+                return Err(StateError::NetworkNotFound);
+            }
+        }
+        let password_hash = hash_password(password).ok_or(StateError::Internal)?;
+
+        let mut inner = self.lock();
+        let group = inner
+            .groups
+            .get_mut(group_name)
+            .ok_or(StateError::NetworkNotFound)?;
+        let previous = std::mem::replace(&mut group.password_hash, password_hash);
+
+        if let Some(path) = &self.networks_file {
+            if let Err(error) = save_networks(path, &inner.groups) {
+                if let Some(group) = inner.groups.get_mut(group_name) {
+                    group.password_hash = previous;
+                }
+                tracing::error!(
+                    %group_name,
+                    path = %path.display(),
+                    error = %error,
+                    "não foi possível persistir a nova senha da rede"
+                );
+                return Err(StateError::Internal);
+            }
+        }
+
+        if let Some(group) = inner.groups.get_mut(group_name) {
+            group.peers.clear();
+        }
+        inner
+            .sessions
+            .retain(|_, session| session.group != group_name);
+        tracing::info!(%group_name, "senha da rede alterada e sessões encerradas");
         Ok(())
     }
 
@@ -398,10 +658,11 @@ fn allocate_ip(group: &Group) -> Option<Ipv4Addr> {
     (2u8..=254)
         .map(|last| Ipv4Addr::new(a, b, c, last))
         .find(|candidate| {
-            !group
-                .peers
-                .values()
-                .any(|peer| peer.virtual_ip == *candidate)
+            !group.members.values().any(|address| address == candidate)
+                && !group
+                    .peers
+                    .values()
+                    .any(|peer| peer.virtual_ip == *candidate)
         })
 }
 
@@ -414,6 +675,43 @@ fn new_session_id(sessions: &HashMap<u64, SessionRef>) -> u64 {
             return session_id;
         }
     }
+}
+
+fn new_session_token() -> String {
+    let mut bytes = [0u8; 32];
+    SessionOsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn secure_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (a, b) in left.bytes().zip(right.bytes()) {
+        difference |= a ^ b;
+    }
+    difference == 0
+}
+
+fn touch_session(
+    group: &mut Group,
+    session_id: u64,
+    now: Instant,
+) -> Result<Vec<PeerInfo>, StateError> {
+    let peer = group
+        .peers
+        .values_mut()
+        .find(|peer| peer.session_id == session_id)
+        .ok_or(StateError::SessionNotFound)?;
+    peer.last_seen = now;
+
+    Ok(group
+        .peers
+        .values()
+        .filter(|peer| peer.session_id != session_id)
+        .map(peer_info)
+        .collect())
 }
 
 fn peer_info(peer: &Peer) -> PeerInfo {
@@ -485,7 +783,7 @@ fn load_networks(path: &Path) -> Result<HashMap<String, Group>> {
 
     let stored: NetworksFile = serde_json::from_str(&contents)
         .with_context(|| format!("arquivo de redes inválido: {}", path.display()))?;
-    if stored.version != NETWORKS_FILE_VERSION {
+    if stored.version != NETWORKS_FILE_VERSION && stored.version != LEGACY_NETWORKS_FILE_VERSION {
         bail!(
             "versão do arquivo de redes não suportada: {}",
             stored.version
@@ -500,11 +798,34 @@ fn load_networks(path: &Path) -> Result<HashMap<String, Group>> {
         if PasswordHash::new(&network.password_hash).is_err() {
             bail!("hash de senha inválido para a rede {name:?}");
         }
+
+        let mut members = BTreeMap::new();
+        for (public_key, encoded_ip) in network.members {
+            if !shadowvpn_core::valid_public_key(&public_key) {
+                bail!("chave pública inválida nos membros da rede {name:?}");
+            }
+            let address: Ipv4Addr = encoded_ip
+                .parse()
+                .with_context(|| format!("IP virtual inválido na rede {name:?}: {encoded_ip}"))?;
+            let [prefix_a, prefix_b, prefix_c] = VIRTUAL_NETWORK_PREFIX;
+            if address.octets()[..3] != [prefix_a, prefix_b, prefix_c]
+                || address.octets()[3] < 2
+                || address.octets()[3] == 255
+            {
+                bail!("IP virtual fora da sub-rede na rede {name:?}: {address}");
+            }
+            if members.values().any(|existing| existing == &address) {
+                bail!("IP virtual duplicado na rede {name:?}: {address}");
+            }
+            members.insert(public_key, address);
+        }
+
         groups.insert(
             name,
             Group {
                 password_hash: network.password_hash,
                 peers: HashMap::new(),
+                members,
             },
         );
     }
@@ -520,6 +841,11 @@ fn save_networks(path: &Path, groups: &HashMap<String, Group>) -> Result<()> {
                 name.clone(),
                 StoredNetwork {
                     password_hash: group.password_hash.clone(),
+                    members: group
+                        .members
+                        .iter()
+                        .map(|(public_key, address)| (public_key.clone(), address.to_string()))
+                        .collect(),
                 },
             )
         })
@@ -687,7 +1013,156 @@ mod tests {
         ));
 
         let again = register(&state, "grupo", "senha-segura", 2, "pc-2").unwrap();
-        assert_eq!(again.virtual_ip, Ipv4Addr::new(26, 26, 26, 2));
+        assert_eq!(again.virtual_ip, Ipv4Addr::new(26, 26, 26, 3));
+
+        let first_again = register(&state, "grupo", "senha-segura", 1, "pc-1").unwrap();
+        assert_eq!(first_again.virtual_ip, first.virtual_ip);
+    }
+
+    #[test]
+    fn heartbeat_accepts_session_token_without_password() {
+        let state = state();
+        let first = register(&state, "grupo", "senha-segura", 1, "pc-1").unwrap();
+        let second = register(&state, "grupo", "senha-segura", 2, "pc-2").unwrap();
+        assert!(!first.session_token.is_empty());
+
+        let peers = state
+            .heartbeat_with_token("grupo", &first.session_token, first.session_id)
+            .unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].session_id, second.session_id);
+        assert!(matches!(
+            state.heartbeat_with_token("grupo", "token-errado", first.session_id),
+            Err(StateError::SessionNotFound)
+        ));
+
+        state
+            .unregister_with_token("grupo", &second.session_token, second.session_id)
+            .unwrap();
+        assert!(state
+            .heartbeat_with_token("grupo", &first.session_token, first.session_id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn persists_virtual_ips_across_restart() {
+        let directory = tempfile::tempdir().expect("diretório temporário");
+        let path = directory.path().join("networks.json");
+        let state = AppState::with_networks_file(Duration::from_secs(75), 8081, None, path.clone())
+            .expect("estado persistente");
+        state
+            .create_network("rede-estavel", "senha-segura")
+            .expect("criar rede");
+        let first = register(&state, "rede-estavel", "senha-segura", 1, "pc-1").unwrap();
+        let second = register(&state, "rede-estavel", "senha-segura", 2, "pc-2").unwrap();
+        assert_eq!(first.virtual_ip, Ipv4Addr::new(26, 26, 26, 2));
+        assert_eq!(second.virtual_ip, Ipv4Addr::new(26, 26, 26, 3));
+
+        drop(state);
+        let reloaded = AppState::with_networks_file(Duration::from_secs(75), 8081, None, path)
+            .expect("recarregar estado");
+        let first_again = register(&reloaded, "rede-estavel", "senha-segura", 1, "pc-1").unwrap();
+        let second_again = register(&reloaded, "rede-estavel", "senha-segura", 2, "pc-2").unwrap();
+        assert_eq!(first_again.virtual_ip, first.virtual_ip);
+        assert_eq!(second_again.virtual_ip, second.virtual_ip);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rolls_back_new_member_when_persistence_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("diretório temporário");
+        let path = directory.path().join("networks.json");
+        let state = AppState::with_networks_file(Duration::from_secs(75), 8081, None, path.clone())
+            .expect("estado persistente");
+        state
+            .create_network("rede-falha", "senha-segura")
+            .expect("criar rede");
+
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o500))
+            .expect("tornar diretório somente leitura");
+        let probe = directory.path().join("probe");
+        if fs::write(&probe, b"").is_ok() {
+            let _ = fs::remove_file(&probe);
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+                .expect("restaurar permissões");
+            return;
+        }
+
+        let result = register(&state, "rede-falha", "senha-segura", 1, "pc-1");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("restaurar permissões");
+
+        assert!(matches!(result, Err(StateError::Internal)));
+        let networks = state.list_networks();
+        assert_eq!(networks.len(), 1);
+        assert_eq!(networks[0].known_peers, 0);
+        assert_eq!(networks[0].online_peers, 0);
+
+        let reloaded = AppState::with_networks_file(Duration::from_secs(75), 8081, None, path)
+            .expect("recarregar estado");
+        assert_eq!(reloaded.list_networks()[0].known_peers, 0);
+    }
+
+    #[test]
+    fn loads_legacy_network_file() {
+        let directory = tempfile::tempdir().expect("diretório temporário");
+        let path = directory.path().join("networks.json");
+        let hash = hash_password("senha-segura").unwrap();
+        let contents = serde_json::json!({
+            "version": 1,
+            "networks": {
+                "legada": { "password_hash": hash }
+            }
+        });
+        fs::write(&path, serde_json::to_vec(&contents).unwrap()).unwrap();
+
+        let state = AppState::with_networks_file(Duration::from_secs(75), 8081, None, path)
+            .expect("arquivo legado");
+        let peer = register(&state, "legada", "senha-segura", 1, "pc-1").unwrap();
+        assert_eq!(peer.virtual_ip, Ipv4Addr::new(26, 26, 26, 2));
+    }
+
+    #[test]
+    fn manages_networks_and_enforces_quota() {
+        let state = AppState::new(Duration::from_secs(75), 8081, None)
+            .with_admin_token(Some("token-de-admin".into()))
+            .with_max_networks(2);
+        assert_eq!(state.admin_token(), Some("token-de-admin"));
+
+        state.create_network("primeira", "senha-segura").unwrap();
+        let peer = register(&state, "primeira", "senha-segura", 1, "pc-1").unwrap();
+        state.create_network("segunda", "senha-segura").unwrap();
+        assert!(matches!(
+            state.create_network("terceira", "senha-segura"),
+            Err(StateError::ServerFull)
+        ));
+
+        let networks = state.list_networks();
+        assert_eq!(networks.len(), 2);
+        assert_eq!(networks[0].name, "primeira");
+        assert_eq!(networks[0].online_peers, 1);
+
+        state
+            .set_network_password("primeira", "nova-senha")
+            .unwrap();
+        assert!(matches!(
+            state.heartbeat_with_token("primeira", &peer.session_token, peer.session_id),
+            Err(StateError::SessionNotFound)
+        ));
+        assert!(register(&state, "primeira", "nova-senha", 1, "pc-1").is_ok());
+        assert!(matches!(
+            register(&state, "primeira", "senha-segura", 2, "pc-2"),
+            Err(StateError::InvalidCredentials)
+        ));
+
+        state.delete_network("primeira").unwrap();
+        assert!(matches!(
+            register(&state, "primeira", "nova-senha", 1, "pc-1"),
+            Err(StateError::NetworkNotFound)
+        ));
     }
 
     #[test]
