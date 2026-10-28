@@ -88,4 +88,4 @@ jobs:
           docker run --rm \
             -e SHADOWVPN_DOMAIN=vpn.example.com \
             -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" \
-            caddy:2 validate --config /etc/caddy/Caddyfile --adapter caddyfile
+            caddy:2 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
