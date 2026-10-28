@@ -109,6 +109,24 @@ shadowvpn-client delete-network minha-rede
 
 A troca de senha encerra todas as sessões da rede. O próximo registro precisa usar a nova senha.
 
+Para listar, revogar ou liberar membros:
+
+```bash
+SHADOWVPN_SERVER=https://vpn.exemplo.com \
+SHADOWVPN_ADMIN_TOKEN='COLE_O_TOKEN' \
+shadowvpn-client list-members minha-rede
+
+SHADOWVPN_SERVER=https://vpn.exemplo.com \
+SHADOWVPN_ADMIN_TOKEN='COLE_O_TOKEN' \
+shadowvpn-client revoke-member minha-rede 'CHAVE_PUBLICA_BASE64'
+
+SHADOWVPN_SERVER=https://vpn.exemplo.com \
+SHADOWVPN_ADMIN_TOKEN='COLE_O_TOKEN' \
+shadowvpn-client restore-member minha-rede 'CHAVE_PUBLICA_BASE64'
+```
+
+A revogação encerra a sessão ativa, libera o IP e bloqueia novas entradas da chave. O bloqueio sobrevive a reinícios e só é removido com `restore-member`; nesse caso o membro recebe um IP livre no próximo registro. Revogar uma chave não impede uma nova identidade de entrar com a senha da rede; para cortar todo o acesso, troque a senha. O mesmo painel está disponível em **Administrar servidor** na GUI.
+
 ## DNS, firewall e relay
 
 O cliente recebe o endereço do relay no registro. Com `SHADOWVPN_RELAY_ADVERTISE=vpn.exemplo.com:8081`, esse é o endereço devolvido. Se o relay usar outro host ou porta, ajuste a variável e a publicação UDP no Compose.
@@ -133,7 +151,7 @@ docker compose exec server tar -C /var/lib/shadowvpn -czf - . \
   > shadowvpn-backup-$(date +%F).tar.gz
 ```
 
-Guarde o backup em local cifrado. O arquivo contém hashes Argon2 das senhas, IPs virtuais persistidos e o token de administração.
+Guarde o backup em local cifrado. O arquivo contém hashes Argon2 das senhas, IPs virtuais persistidos, chaves revogadas e o token de administração.
 
 Para atualizar:
 
@@ -146,6 +164,8 @@ docker compose logs -f server
 ```
 
 O volume é preservado. Faça backup antes de mudanças de versão. Atualize o servidor primeiro: clientes 0.4.x continuam funcionando por fallback, mas clientes 0.5.x não conectam em servidor 0.4.x.
+
+Na atualização de 0.5.0 para 0.5.1, o `networks.json` v2 é lido automaticamente e passa a v3 na próxima gravação. A v3 inclui a lista de membros revogados. O servidor 0.5.0 não lê a v3; para reverter, restaure o backup.
 
 ## Rate limiting e abuso
 

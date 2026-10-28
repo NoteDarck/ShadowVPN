@@ -73,6 +73,14 @@ async fn main() -> Result<()> {
             "/admin/networks/:name/password",
             post(routes::admin_rotate_password),
         )
+        .route(
+            "/admin/networks/:name/members",
+            get(routes::admin_list_members).delete(routes::admin_revoke_member),
+        )
+        .route(
+            "/admin/networks/:name/members/restore",
+            post(routes::admin_restore_member),
+        )
         .layer(DefaultBodyLimit::max(16 * 1024))
         .with_state(state);
 
@@ -115,6 +123,7 @@ async fn root() -> axum::Json<serde_json::Value> {
             "/peers",
             "/unregister",
             "/admin/networks",
+            "/admin/networks/{name}/members",
             "/health"
         ]
     }))

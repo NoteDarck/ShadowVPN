@@ -23,7 +23,8 @@ ShadowVPN é uma VPN de grupo inspirada no Radmin VPN, escrita em Rust. Cada com
 - Windows, Linux (x86_64 e aarch64) e macOS (Intel e Apple Silicon).
 - Redes sobrevivem a reinícios do servidor; sessões e peers ficam apenas em memória.
 - Heartbeat autenticado por token de sessão, expiração, limpeza automática e reconexão com backoff.
-- Autenticação administrativa por Bearer token para criar, listar, excluir e trocar a senha de redes.
+- Autenticação administrativa por Bearer token para criar, listar, excluir, trocar a senha de redes e revogar ou liberar membros.
+- Painel **Administrar servidor** na GUI para listar redes e membros, trocar senha, excluir rede e revogar acessos.
 - Quota de redes configurável e deploy seguro com Docker Compose, Caddy e systemd.
 - Nomes dos computadores, fingerprints e latência do servidor exibidos na GUI.
 - Releases automatizados com AppImage, instalador Windows, checksums e `wintun.dll` no pacote Windows.
@@ -56,6 +57,7 @@ ShadowVPN é uma VPN de grupo inspirada no Radmin VPN, escrita em Rust. Cada com
 4. O cliente verifica a prova de cada peer, calcula um PSK pairwise com X25519/HKDF e cria a interface TUN; em seguida envia um `HELLO` UDP ao relay.
 5. Cada peer mantém uma sessão WireGuard com os demais usando o PSK do par. O relay encaminha os datagramas pelo `session_id` de destino.
 6. A cada 20 segundos o cliente faz `POST /peers` usando o token de sessão, sem reenviar a senha, para renovar o peer e atualizar a lista. Se o servidor ficar inacessível, o cliente tenta reconectar com backoff exponencial até 30 segundos.
+7. O administrador pode revogar uma chave pública. A sessão ativa cai, o IP fica livre e novas entradas daquela chave são recusadas com `403` até ela ser liberada. Para remover o acesso de todos, troque a senha da rede.
 
 O convite reúne o endereço do coordenador e o nome da rede. Ele não inclui a senha, não substitui o servidor e não é um serviço central: alguém ainda precisa hospedar o `shadowvpn-server`.
 
@@ -161,6 +163,8 @@ O servidor de coordenação também pode ser configurado manualmente na seção 
 
 A criação da rede não exige privilégios especiais; a conexão TUN sim. A GUI não eleva privilégios automaticamente. No Windows, abra como Administrador; no Linux/macOS, inicie pelo terminal com as permissões necessárias.
 
+O botão **Administrar servidor** abre o painel de redes e membros. Informe a URL e o token (no servidor local o token é lido automaticamente), clique em **Atualizar** e escolha **Gerenciar** em uma rede. O painel permite recarregar membros, revogar ou liberar uma chave, trocar a senha e excluir a rede com confirmação. O token permanece apenas na memória da GUI.
+
 ## Configuração
 
 ### Cliente
@@ -177,7 +181,7 @@ Flags da CLI (as variáveis de ambiente equivalentes estão entre parênteses):
 | `--admin-token-file` | `SHADOWVPN_ADMIN_TOKEN_FILE` | — (alternativa ao token inline) |
 | `--identity` | `SHADOWVPN_IDENTITY` | caminho padrão do sistema |
 | `--create` | `SHADOWVPN_CREATE` | `false` |
-| subcomandos | — | `create-network`, `list-networks`, `delete-network`, `rotate-password` |
+| subcomandos | — | `create-network`, `list-networks`, `delete-network`, `rotate-password`, `list-members`, `revoke-member`, `restore-member` |
 | — | `SHADOWVPN_HOSTNAME` | hostname do sistema; exibido aos peers |
 
 Prefira variáveis de ambiente ou arquivos em vez de `--password` e `--admin-token`: argumentos de linha de comando podem aparecer no histórico e na lista de processos. O token em `SHADOWVPN_ADMIN_TOKEN_FILE` é lido do arquivo e nunca precisa ser passado inline.
@@ -189,7 +193,12 @@ shadowvpn-client list-networks
 shadowvpn-client create-network --name minha-rede --password 'uma-senha-forte'
 shadowvpn-client rotate-password minha-rede --new-password 'outra-senha-forte'
 shadowvpn-client delete-network minha-rede
+shadowvpn-client list-members minha-rede
+shadowvpn-client revoke-member minha-rede 'CHAVE_PUBLICA_BASE64'
+shadowvpn-client restore-member minha-rede 'CHAVE_PUBLICA_BASE64'
 ```
+
+`revoke-member` encerra a sessão atual, libera o IP e bloqueia novas entradas daquela chave pública. A chave é listada por `list-members` e continua bloqueada após reinícios. `restore-member` remove o bloqueio; o membro recebe um IP livre no próximo registro. Revogar uma chave não impede alguém com a senha de gerar outra identidade, então use **Trocar senha** para cortar o acesso de todos.
 
 O nome do grupo deve ter até 64 caracteres alfanuméricos, `-` ou `_`. A senha deve ter entre 8 e 128 caracteres. O convite tem precedência sobre `--server` e `--group`.
 
@@ -253,8 +262,11 @@ Para IPv6, use colchetes: `SHADOWVPN_RELAY_ADVERTISE=[2001:db8::10]:8081`.
 | `GET` | `/admin/networks` | Listar redes, peers online e membros conhecidos (Bearer token) |
 | `DELETE` | `/admin/networks/{nome}` | Excluir uma rede e suas sessões (Bearer token) |
 | `POST` | `/admin/networks/{nome}/password` | Trocar a senha e encerrar sessões (Bearer token) |
+| `GET` | `/admin/networks/{nome}/members` | Listar membros online, offline e revogados (Bearer token) |
+| `DELETE` | `/admin/networks/{nome}/members` | Revogar uma chave; corpo JSON `{"public_key":"..."}` (Bearer token) |
+| `POST` | `/admin/networks/{nome}/members/restore` | Liberar uma chave revogada; corpo JSON `{"public_key":"..."}` (Bearer token) |
 
-As redes são persistidas em `data/networks.json` no servidor manual ou na pasta de dados do usuário quando o servidor é iniciado pela GUI (configurável por `SHADOWVPN_NETWORKS_FILE` em ambos os casos), e sobrevivem a reinícios. O arquivo guarda hashes Argon2 e o mapa de membros com os IPs virtuais estáveis; peers e sessões ativas ficam em memória e são perdidos no reinício, mas o cliente reconecta automaticamente e recupera o mesmo IP. O arquivo recebe permissão `0600` no Unix. O `POST /register` exige o objeto `identity` com a assinatura XEdDSA da chave pública e da rede.
+As redes são persistidas em `data/networks.json` no servidor manual ou na pasta de dados do usuário quando o servidor é iniciado pela GUI (configurável por `SHADOWVPN_NETWORKS_FILE` em ambos os casos), e sobrevivem a reinícios. O arquivo guarda hashes Argon2, o mapa de membros com os IPs virtuais estáveis e as chaves revogadas. Peers e sessões ativas ficam em memória e são perdidos no reinício, mas o cliente reconecta automaticamente e recupera o mesmo IP. O arquivo recebe permissão `0600` no Unix; a versão 3 é gravada na próxima alteração e versões 1 e 2 são lidas automaticamente. O `POST /register` exige o objeto `identity` com a assinatura XEdDSA da chave pública e da rede.
 
 ## Portas, firewall e HTTPS
 
@@ -290,8 +302,8 @@ Use um `SHADOWVPN_IDENTITY` explícito se quiser que a chave criada pelo process
 O AppImage não carrega capabilities. Para usar a GUI empacotada, execute com `sudo`:
 
 ```bash
-chmod +x ShadowVPN-v0.5.0-linux-x86_64.AppImage
-sudo -E ./ShadowVPN-v0.5.0-linux-x86_64.AppImage
+chmod +x ShadowVPN-v0.5.1-linux-x86_64.AppImage
+sudo -E ./ShadowVPN-v0.5.1-linux-x86_64.AppImage
 ```
 
 Alternativamente, extraia o AppImage com `--appimage-extract` e aplique `CAP_NET_ADMIN` ao binário interno.
@@ -314,7 +326,7 @@ sudo ./shadowvpn-client
 Se o arquivo foi baixado pelo navegador e o Gatekeeper bloquear:
 
 ```bash
-xattr -dr com.apple.quarantine ShadowVPN-v0.5.0-macos-aarch64
+xattr -dr com.apple.quarantine ShadowVPN-v0.5.1-macos-aarch64
 ```
 
 Os binários não são assinados nem notarizados.
@@ -340,8 +352,8 @@ O instalador Windows foi compilado com Inno Setup e registra `shadowvpn-gui.exe`
 Para criar uma release:
 
 ```bash
-git tag v0.5.0
-git push origin v0.5.0
+git tag v0.5.1
+git push origin v0.5.1
 ```
 
 Também é possível executar o workflow manualmente em **Actions → Release multiplataforma → Run workflow**, informando uma tag que já exista no remoto.
@@ -367,7 +379,7 @@ Binários gerados em `target/release/`: `shadowvpn-server`, `shadowvpn-client` e
 - A API de coordenação pode usar HTTP simples em laboratório. Em qualquer rede não confiável, use HTTPS. A senha da rede só é enviada no registro; o heartbeat seguinte usa um token de sessão aleatório.
 - O servidor armazena apenas o hash Argon2 da senha do grupo. A senha em texto claro existe somente durante a requisição.
 - Os `session_id` são compartilhados com os peers do grupo para permitir o roteamento. Um membro mal-intencionado do grupo pode tentar interferir no relay; o WireGuard ainda impede a leitura ou falsificação dos pacotes, mas indisponibilidade e metadados não são protegidos.
-- Com `SHADOWVPN_ADMIN_TOKEN` configurado, criar, listar, excluir e trocar senhas exige Bearer token; sem token, a criação fica aberta e o servidor avisa no log. O token é comparado em tempo constante e deve ser tratado como segredo.
+- Com `SHADOWVPN_ADMIN_TOKEN` configurado, criar, listar, excluir, trocar senhas, revogar e liberar membros exige Bearer token; sem token, a criação fica aberta e o servidor avisa no log. O token é comparado em tempo constante e deve ser tratado como segredo.
 - Há quota de redes (`SHADOWVPN_MAX_NETWORKS`), mas não há rate limiting por IP. Para um servidor público, coloque a API atrás de um proxy/CDN com limites de requisição e monitore o consumo de memória/CPU.
 - Não há auditoria de segurança independente, testes de penetração ou garantia de anonimato.
 
@@ -385,6 +397,7 @@ Binários gerados em `target/release/`: `shadowvpn-server`, `shadowvpn-client` e
 - **Instalação limitada**: há instalador para Windows, AppImage para Linux e units systemd em `deploy/systemd`; não há tray, autostart universal ou serviço nativo para macOS.
 - **Sem assinatura de código**: Windows SmartScreen, o instalador e o macOS Gatekeeper podem avisar.
 - **Sem túnel de internet completa**: apenas a sub-rede virtual é roteada.
+- **Revogação por identidade**: a revogação bloqueia uma chave pública, mas uma identidade nova ainda entra com a mesma senha da rede. Para revogar a pessoa, troque a senha.
 
 ## Solução de problemas
 
@@ -403,17 +416,23 @@ Binários gerados em `target/release/`: `shadowvpn-server`, `shadowvpn-client` e
 - Se estiver atrás de proxy reverso, o cabeçalho `Host` pode não ser o endereço do relay.
 
 **A conexão cai após reiniciar o servidor**
-- O cliente detecta a queda no heartbeat e reconecta com backoff. Redes, membros e IPs persistem; as sessões antigas não. Se a rede tiver sido excluída ou a senha trocada, a reconexão falha e a GUI mostra o erro.
+- O cliente detecta a queda no heartbeat e reconecta com backoff. Redes, membros e IPs persistem; as sessões antigas não. Se a rede tiver sido excluída, a senha trocada ou a chave revogada, a reconexão falha e a GUI mostra o erro. Peça ao administrador para usar `restore-member` se a revogação foi um engano.
 
 **Linux: erro de permissão em `/dev/net/tun`**
 - Confirme que o dispositivo existe: `ls -l /dev/net/tun`.
 - Use `sudo` ou `setcap cap_net_admin+ep` no binário.
 
+## Atualizando de 0.5.0 para 0.5.1
+
+O servidor 0.5.1 adiciona revogação persistente de membros, listagem de membros e um painel de administração na GUI. A compatibilidade de clientes 0.5.0 com o servidor 0.5.1 é preservada; o novo cliente também aceita servidor 0.5.0, mas as rotas de membros só existem a partir do 0.5.1.
+
+Atualize o servidor primeiro e faça backup de `networks.json`. O arquivo v2 é lido e passa a v3 na próxima gravação. O servidor 0.5.0 **não lê** o arquivo v3; para reverter, restaure o backup ou remova a seção de membros revogados com o servidor parado.
+
 ## Atualizando de 0.4.x para 0.5.x
 
-O servidor 0.5.x adiciona token de sessão, IPs persistentes, administração autenticada e quota de redes. Clientes antigos continuam aceitos pelo fallback de senha, mas devem ser atualizados para usar heartbeat por token e reconexão automática. O cliente 0.5.x exige servidor 0.5.x: atualize o servidor primeiro e depois os clientes.
+O servidor 0.5.x adiciona token de sessão, IPs persistentes, administração autenticada, revogação de membros e quota de redes. Clientes antigos continuam aceitos pelo fallback de senha, mas devem ser atualizados para usar heartbeat por token e reconexão automática. O cliente 0.5.x exige servidor 0.5.x: atualize o servidor primeiro e depois os clientes.
 
-A chave `identity.key` existente continua válida e o fingerprint não muda. Redes e senhas não precisam ser recriadas. O `networks.json` v1 é lido automaticamente e migra para v2 quando um peer se registra. Faça backup antes de atualizar; rode servidor e clientes novos juntos quando possível.
+A chave `identity.key` existente continua válida e o fingerprint não muda. Redes e senhas não precisam ser recriadas. O `networks.json` v1 é lido automaticamente e migra para v3 na próxima gravação; a v2 também é aceita. Faça backup antes de atualizar; rode servidor e clientes novos juntos quando possível.
 
 ## Estrutura
 

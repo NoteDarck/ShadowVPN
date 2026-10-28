@@ -1,6 +1,6 @@
 # Como conectar no ShadowVPN
 
-Este guia cobre o fluxo da versão 0.5.0 em diante: primeiro alguém **cria a rede** no servidor, gera um **convite** e os outros computadores entram com o link e a senha. A rede fica salva mesmo quando todos desconectam ou o servidor reinicia.
+Este guia cobre o fluxo da versão 0.5.x: primeiro alguém **cria a rede** no servidor, gera um **convite** e os outros computadores entram com o link e a senha. A rede fica salva mesmo quando todos desconectam ou o servidor reinicia.
 
 ## O que você precisa
 
@@ -222,6 +222,7 @@ Erros comuns:
 - `429 Too Many Requests`: o servidor atingiu `SHADOWVPN_MAX_NETWORKS`.
 - `500 Internal Server Error`: falha ao gravar o arquivo de redes; verifique permissões e `SHADOWVPN_NETWORKS_FILE`.
 - `503 Service Unavailable`: administração não configurada no servidor; defina o token no servidor.
+- `403 Forbidden`: o membro foi revogado pelo administrador; use `restore-member` ou peça para o administrador liberar a chave.
 
 ### Regras de nome e senha
 
@@ -229,6 +230,39 @@ Erros comuns:
 - Senha: entre 8 e 128 caracteres.
 - Não reutilize a senha de outros serviços.
 - A senha pode ser trocada com privilégio administrativo. A troca encerra todas as sessões da rede e os clientes precisam entrar novamente com a nova senha.
+
+### Administrar redes e membros
+
+Na GUI, clique em **Administrar servidor**. Informe a URL e o token administrativo; no servidor local o token é lido automaticamente. Clique em **Atualizar**, escolha uma rede em **Gerenciar** e use o painel para:
+
+- recarregar a lista de membros online, offline e revogados;
+- **Revogar** uma chave pública (pede confirmação) ou **Liberar** uma chave revogada;
+- trocar a senha da rede, com confirmação, encerrando todas as sessões;
+- excluir a rede, com confirmação.
+
+Pela CLI, use o mesmo token administrativo:
+
+```bash
+SHADOWVPN_SERVER=https://vpn.exemplo.com \
+SHADOWVPN_ADMIN_TOKEN='COLE_O_TOKEN' \
+./shadowvpn-client list-members minha-rede
+```
+
+A saída mostra o estado, o IP virtual, o hostname, o fingerprint e a chave completa de cada membro. Para revogar ou liberar:
+
+```bash
+SHADOWVPN_SERVER=https://vpn.exemplo.com \
+SHADOWVPN_ADMIN_TOKEN='COLE_O_TOKEN' \
+./shadowvpn-client revoke-member minha-rede 'CHAVE_PUBLICA_BASE64'
+
+SHADOWVPN_SERVER=https://vpn.exemplo.com \
+SHADOWVPN_ADMIN_TOKEN='COLE_O_TOKEN' \
+./shadowvpn-client restore-member minha-rede 'CHAVE_PUBLICA_BASE64'
+```
+
+Revogar encerra a sessão ativa, libera o IP e bloqueia novas entradas daquela chave. O bloqueio é persistente e continua após reiniciar o servidor. A chave só volta a entrar depois de `restore-member`; ela recebe um IP livre, que pode ser diferente do anterior. Para cortar o acesso de todos, troque a senha da rede com `rotate-password` ou pelo painel da GUI.
+
+Revogar uma chave não impede alguém que ainda tenha a senha de gerar uma nova identidade. Use senhas fortes e troque a senha quando precisar remover o acesso de uma pessoa, não apenas de um computador.
 
 ## 3. Entrar na rede
 
@@ -378,7 +412,7 @@ SHADOWVPN_RELAY_ADVERTISE=vpn.exemplo.com:8081 ./shadowvpn-server
 
 ### Reiniciei o servidor e a conexão caiu
 
-As redes, os membros e os IPs virtuais são persistentes, mas as sessões ativas não. O cliente detecta a queda no heartbeat e reconecta com backoff; o IP virtual é mantido. Se a rede tiver sido apagada ou a senha alterada pelo administrador, o cliente mostra o erro e será necessário entrar novamente.
+As redes, os membros e os IPs virtuais são persistentes, mas as sessões ativas não. O cliente detecta a queda no heartbeat e reconecta com backoff; o IP virtual é mantido. Se a rede tiver sido apagada, a senha alterada ou a chave revogada pelo administrador, o cliente mostra o erro e será necessário entrar novamente (ou pedir a liberação da chave).
 
 ### O servidor não consegue salvar as redes
 
@@ -396,11 +430,17 @@ A chave de identidade daquele computador foi recriada. Confirme com o dono do pe
 
 O instalador e a GUI do Windows abrem no Wine, mas a conexão real não funciona: o Wintun exige um driver de kernel do Windows e falha no Wine. Para testar a VPN, use Windows nativo ou uma VM Windows.
 
+## Atualizando de 0.5.0 para 0.5.1
+
+Atualize o servidor primeiro. O 0.5.1 adiciona listagem e revogação persistente de membros e o painel **Administrar servidor** na GUI. Clientes 0.5.0 continuam funcionando; as rotas de membros só existem no servidor 0.5.1.
+
+O `networks.json` v2 é lido automaticamente e passa a v3 na próxima gravação. Faça backup antes de atualizar. O servidor 0.5.0 não lê a versão 3; para reverter, restaure o backup do arquivo. O token administrativo e as senhas das redes não mudam.
+
 ## Atualizando de 0.4.x para 0.5.x
 
 Atualize primeiro o servidor e depois os clientes. O servidor 0.5.x ainda aceita clientes 0.4.x pelo fallback de senha, mas o cliente 0.5.x exige servidor 0.5.x para usar o heartbeat por token.
 
-A identidade e as redes existentes continuam válidas. O `networks.json` v1 é migrado para v2 no primeiro registro, preservando os IPs virtuais a partir daí. Configure `SHADOWVPN_ADMIN_TOKEN` ou `SHADOWVPN_ADMIN_TOKEN_FILE` e use HTTPS conforme [DEPLOY.md](DEPLOY.md).
+A identidade e as redes existentes continuam válidas. O `networks.json` v1/v2 é lido automaticamente e passa a v3 na próxima gravação, preservando os IPs virtuais. Configure `SHADOWVPN_ADMIN_TOKEN` ou `SHADOWVPN_ADMIN_TOKEN_FILE` e use HTTPS conforme [DEPLOY.md](DEPLOY.md).
 
 ## Atualizando de 0.3.x para 0.4.x
 

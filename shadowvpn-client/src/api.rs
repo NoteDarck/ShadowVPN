@@ -3,9 +3,9 @@ use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use shadowvpn_core::{
-    valid_group_name, CreateNetworkRequest, CreateNetworkResponse, ErrorResponse,
-    NetworkListResponse, PeerIdentity, PeersRequest, PeersResponse, RegisterRequest,
-    RegisterResponse, RotatePasswordRequest, UnregisterRequest,
+    valid_group_name, valid_public_key, CreateNetworkRequest, CreateNetworkResponse, ErrorResponse,
+    MemberKeyRequest, MemberListResponse, NetworkListResponse, PeerIdentity, PeersRequest,
+    PeersResponse, RegisterRequest, RegisterResponse, RotatePasswordRequest, UnregisterRequest,
 };
 use std::fmt;
 use std::time::Duration;
@@ -96,6 +96,47 @@ impl Api {
             .send()
             .await
             .context("falha ao excluir rede")?;
+        ensure_success(response).await
+    }
+
+    pub async fn list_members(&self, group_name: &str) -> Result<MemberListResponse> {
+        validate_group_name(group_name)?;
+        let url = format!("{}/admin/networks/{group_name}/members", self.base);
+        let response = self
+            .authorized(self.client.get(url))
+            .send()
+            .await
+            .context("falha ao consultar membros da rede")?;
+        decode_response(response).await
+    }
+
+    pub async fn revoke_member(&self, group_name: &str, public_key: &str) -> Result<()> {
+        validate_group_name(group_name)?;
+        validate_public_key(public_key)?;
+        let url = format!("{}/admin/networks/{group_name}/members", self.base);
+        let response = self
+            .authorized(self.client.delete(url))
+            .json(&MemberKeyRequest {
+                public_key: public_key.to_string(),
+            })
+            .send()
+            .await
+            .context("falha ao revogar membro")?;
+        ensure_success(response).await
+    }
+
+    pub async fn restore_member(&self, group_name: &str, public_key: &str) -> Result<()> {
+        validate_group_name(group_name)?;
+        validate_public_key(public_key)?;
+        let url = format!("{}/admin/networks/{group_name}/members/restore", self.base);
+        let response = self
+            .authorized(self.client.post(url))
+            .json(&MemberKeyRequest {
+                public_key: public_key.to_string(),
+            })
+            .send()
+            .await
+            .context("falha ao liberar membro")?;
         ensure_success(response).await
     }
 
@@ -233,6 +274,14 @@ fn validate_group_name(group_name: &str) -> Result<()> {
         Ok(())
     } else {
         bail!("nome de rede inválido")
+    }
+}
+
+fn validate_public_key(public_key: &str) -> Result<()> {
+    if valid_public_key(public_key) {
+        Ok(())
+    } else {
+        bail!("chave pública inválida")
     }
 }
 

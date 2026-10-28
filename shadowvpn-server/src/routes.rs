@@ -6,8 +6,9 @@ use axum::{
 };
 use shadowvpn_core::{
     clean_hostname, valid_group_name, valid_password, valid_public_key, CreateNetworkRequest,
-    CreateNetworkResponse, ErrorResponse, NetworkListResponse, PeersRequest, PeersResponse,
-    RegisterRequest, RegisterResponse, RotatePasswordRequest, UnregisterRequest,
+    CreateNetworkResponse, ErrorResponse, MemberKeyRequest, MemberListResponse,
+    NetworkListResponse, PeersRequest, PeersResponse, RegisterRequest, RegisterResponse,
+    RotatePasswordRequest, UnregisterRequest,
 };
 
 type ApiError = (StatusCode, Json<ErrorResponse>);
@@ -47,6 +48,11 @@ fn state_error(error: StateError) -> ApiError {
         StateError::SessionNotFound => {
             api_error(StatusCode::NOT_FOUND, "sessão não encontrada ou expirada")
         }
+        StateError::MemberNotFound => api_error(StatusCode::NOT_FOUND, "membro não encontrado"),
+        StateError::MemberBlocked => api_error(
+            StatusCode::FORBIDDEN,
+            "este membro foi revogado pelo administrador",
+        ),
         StateError::Internal => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "erro interno ao processar a requisição",
@@ -152,6 +158,57 @@ pub async fn admin_delete_network(
         return Err(api_error(StatusCode::BAD_REQUEST, "nome de rede inválido"));
     }
     state.delete_network(&group_name).map_err(state_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn admin_list_members(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(group_name): Path<String>,
+) -> ApiResult<MemberListResponse> {
+    require_admin(&state, &headers)?;
+    if !valid_group_name(&group_name) {
+        return Err(api_error(StatusCode::BAD_REQUEST, "nome de rede inválido"));
+    }
+    let members = state.list_members(&group_name).map_err(state_error)?;
+    Ok(Json(MemberListResponse { members }))
+}
+
+pub async fn admin_revoke_member(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(group_name): Path<String>,
+    Json(req): Json<MemberKeyRequest>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers)?;
+    if !valid_group_name(&group_name) || !valid_public_key(&req.public_key) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "rede ou chave pública inválida",
+        ));
+    }
+    state
+        .revoke_member(&group_name, &req.public_key)
+        .map_err(state_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn admin_restore_member(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(group_name): Path<String>,
+    Json(req): Json<MemberKeyRequest>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers)?;
+    if !valid_group_name(&group_name) || !valid_public_key(&req.public_key) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "rede ou chave pública inválida",
+        ));
+    }
+    state
+        .restore_member(&group_name, &req.public_key)
+        .map_err(state_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -301,6 +358,14 @@ mod tests {
                 "/admin/networks/:name/password",
                 axum::routing::post(admin_rotate_password),
             )
+            .route(
+                "/admin/networks/:name/members",
+                axum::routing::get(admin_list_members).delete(admin_revoke_member),
+            )
+            .route(
+                "/admin/networks/:name/members/restore",
+                axum::routing::post(admin_restore_member),
+            )
             .with_state(state)
     }
 
@@ -333,6 +398,16 @@ mod tests {
             .uri(uri)
             .header("authorization", format!("Bearer {token}"))
             .body(Body::empty())
+            .expect("requisição")
+    }
+
+    fn delete_json_auth(uri: &str, body: serde_json::Value, token: &str) -> Request<Body> {
+        Request::builder()
+            .method("DELETE")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(body.to_string()))
             .expect("requisição")
     }
 
@@ -504,6 +579,89 @@ mod tests {
             .await
             .expect("desconexão por token");
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn admin_member_routes_list_revoke_and_restore() {
+        let state = test_state(Some("token-de-admin"));
+        state
+            .create_network("rede-api", "senha-segura")
+            .expect("rede");
+        let app = app_with_state(state);
+
+        let response = app
+            .clone()
+            .oneshot(post("/register", register_body("rede-api", "senha-segura")))
+            .await
+            .expect("registro");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        let session_id = body["session_id"].as_u64().expect("sessão");
+        let session_token = body["session_token"].as_str().expect("token");
+
+        let response = app
+            .clone()
+            .oneshot(get_auth(
+                "/admin/networks/rede-api/members",
+                "token-de-admin",
+            ))
+            .await
+            .expect("listar membros");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["members"][0]["public_key"], key());
+        assert_eq!(body["members"][0]["virtual_ip"], "26.26.26.2");
+        assert_eq!(body["members"][0]["online"], true);
+        assert_eq!(body["members"][0]["blocked"], false);
+
+        let response = app
+            .clone()
+            .oneshot(delete_json_auth(
+                "/admin/networks/rede-api/members",
+                serde_json::json!({ "public_key": key() }),
+                "token-de-admin",
+            ))
+            .await
+            .expect("revogar membro");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(post(
+                "/peers",
+                serde_json::json!({
+                    "group_name": "rede-api",
+                    "session_id": session_id,
+                    "session_token": session_token
+                }),
+            ))
+            .await
+            .expect("sessão revogada");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(post("/register", register_body("rede-api", "senha-segura")))
+            .await
+            .expect("registro revogado");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(post_auth(
+                "/admin/networks/rede-api/members/restore",
+                serde_json::json!({ "public_key": key() }),
+                "token-de-admin",
+            ))
+            .await
+            .expect("liberar membro");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(post("/register", register_body("rede-api", "senha-segura")))
+            .await
+            .expect("registro liberado");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

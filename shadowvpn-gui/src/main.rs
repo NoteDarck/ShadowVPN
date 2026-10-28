@@ -6,10 +6,10 @@ use eframe::egui::{
 use local_server::{is_loopback_url, relay_port, LocalServer, ToggleOutcome};
 use saved_networks::{SavedNetwork, SavedNetworks};
 use shadowvpn_client::{ClientConfig, ClientEvent, ClientHandle};
-use shadowvpn_core::{Invite, PeerInfo};
+use shadowvpn_core::{valid_password, Invite, NetworkMember, NetworkSummary, PeerInfo};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, TryRecvError};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Duration;
 
 mod app_paths;
@@ -37,6 +37,18 @@ enum EntryMode {
     Create,
     Join,
     Saved,
+}
+
+enum AdminTaskResult {
+    Snapshot {
+        networks: Result<Vec<NetworkSummary>, String>,
+        members: Option<(String, Result<Vec<NetworkMember>, String>)>,
+    },
+    Action {
+        result: Result<(), String>,
+        message: String,
+        deleted: bool,
+    },
 }
 
 fn import_local_networks_into(saved: &mut SavedNetworks) -> Result<usize, String> {
@@ -92,6 +104,20 @@ struct ShadowVpnApp {
     invite_applied: bool,
     show_password: bool,
     show_settings: bool,
+    show_admin: bool,
+    admin_server: String,
+    admin_networks: Vec<NetworkSummary>,
+    admin_members: Vec<NetworkMember>,
+    admin_selected: Option<String>,
+    admin_busy: bool,
+    admin_receiver: Option<Receiver<AdminTaskResult>>,
+    admin_error: Option<String>,
+    admin_notice: Option<String>,
+    admin_delete_confirm: Option<String>,
+    admin_revoke_confirm: Option<String>,
+    admin_new_password: String,
+    admin_new_password_confirm: String,
+    admin_rotate_confirm: bool,
     styled: bool,
     logo: Option<egui::TextureHandle>,
     status: String,
@@ -153,6 +179,20 @@ impl Default for ShadowVpnApp {
             invite_applied: false,
             show_password: false,
             show_settings: false,
+            show_admin: false,
+            admin_server: String::new(),
+            admin_networks: Vec::new(),
+            admin_members: Vec::new(),
+            admin_selected: None,
+            admin_busy: false,
+            admin_receiver: None,
+            admin_error: None,
+            admin_notice: None,
+            admin_delete_confirm: None,
+            admin_revoke_confirm: None,
+            admin_new_password: String::new(),
+            admin_new_password_confirm: String::new(),
+            admin_rotate_confirm: false,
             styled: false,
             logo: None,
             status: "Pronto para conectar".into(),
@@ -204,6 +244,7 @@ impl eframe::App for ShadowVpnApp {
             });
 
         self.settings_window(ctx);
+        self.admin_window(ctx);
     }
 }
 
@@ -352,6 +393,27 @@ impl ShadowVpnApp {
 
                 ui.add_space(12.0);
                 self.local_server_card(ui, animation_time);
+
+                ui.add_space(8.0);
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 32.0],
+                        egui::Button::new(
+                            RichText::new("Administrar servidor")
+                                .size(11.5)
+                                .color(SERVER_ON),
+                        )
+                        .fill(CARD)
+                        .stroke(Stroke::new(1.0_f32, SERVER_ON.gamma_multiply(0.35)))
+                        .rounding(Rounding::same(8.0)),
+                    )
+                    .on_hover_text(
+                        "Lista redes, membros e permite trocar senha, excluir rede e revogar acessos.",
+                    )
+                    .clicked()
+                {
+                    self.open_admin();
+                }
 
                 ui.add_space(18.0);
                 ui.label(RichText::new("SESSÃO").size(10.0).strong().color(MUTED));
@@ -1738,17 +1800,7 @@ impl ShadowVpnApp {
         let server = self.server.clone();
         let group = self.group.clone();
         let password = self.password.clone();
-        let admin_token = {
-            let value = self.admin_token.trim();
-            let local_url = self.local_server.url();
-            let using_local_server = is_loopback_url(&self.server)
-                || self.server.trim().trim_end_matches('/') == local_url;
-            if value.is_empty() && using_local_server {
-                local_server::local_admin_token()
-            } else {
-                (!value.is_empty()).then(|| value.to_string())
-            }
-        };
+        let admin_token = self.resolved_admin_token(&self.server);
         let (sender, receiver) = mpsc::channel();
         self.creating_network = true;
         self.create_result = Some(receiver);
@@ -1764,6 +1816,832 @@ impl ShadowVpnApp {
             .map_err(|error| format!("{error:#}"));
             let _ = sender.send(result);
         });
+    }
+
+    fn resolved_admin_token(&self, server: &str) -> Option<String> {
+        let value = self.admin_token.trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+
+        let local_url = self.local_server.url();
+        let using_local_server =
+            is_loopback_url(server) || server.trim().trim_end_matches('/') == local_url;
+        if using_local_server {
+            local_server::local_admin_token()
+        } else {
+            None
+        }
+    }
+
+    fn open_admin(&mut self) {
+        self.show_admin = true;
+        if self.admin_server.trim().is_empty() {
+            self.admin_server = self.server.trim().to_owned();
+        }
+        if self.admin_networks.is_empty()
+            && !self.admin_busy
+            && self.resolved_admin_token(&self.admin_server).is_some()
+        {
+            self.refresh_admin();
+        }
+    }
+
+    fn admin_credentials(&mut self) -> Option<(String, String)> {
+        let server = self.admin_server.trim().to_owned();
+        if server.is_empty() {
+            self.admin_error = Some("Informe a URL do servidor.".into());
+            return None;
+        }
+        match self.resolved_admin_token(&server) {
+            Some(token) => Some((server, token)),
+            None => {
+                self.admin_error = Some(
+                    "Informe o token de administração. No servidor local ele é lido automaticamente."
+                        .into(),
+                );
+                None
+            }
+        }
+    }
+
+    fn refresh_admin(&mut self) {
+        if self.admin_busy {
+            return;
+        }
+        let Some((server, token)) = self.admin_credentials() else {
+            return;
+        };
+        let selected = self.admin_selected.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.admin_receiver = Some(receiver);
+        self.admin_busy = true;
+        self.admin_error = None;
+
+        std::thread::spawn(move || {
+            let networks = shadowvpn_client::list_networks(&server, &token)
+                .map(|response| response.networks)
+                .map_err(|error| format!("{error:#}"));
+            let members = selected.map(|name| {
+                let result = shadowvpn_client::list_members(&server, &token, &name)
+                    .map(|response| response.members)
+                    .map_err(|error| format!("{error:#}"));
+                (name, result)
+            });
+            let _ = sender.send(AdminTaskResult::Snapshot { networks, members });
+        });
+    }
+
+    fn start_admin_action<F>(&mut self, action: F, message: String, deleted: bool)
+    where
+        F: FnOnce() -> Result<(), String> + Send + 'static,
+    {
+        if self.admin_busy {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.admin_receiver = Some(receiver);
+        self.admin_busy = true;
+        self.admin_error = None;
+        self.admin_notice = None;
+
+        std::thread::spawn(move || {
+            let result = action();
+            let _ = sender.send(AdminTaskResult::Action {
+                result,
+                message,
+                deleted,
+            });
+        });
+    }
+
+    fn delete_admin_network(&mut self, name: String) {
+        if self.admin_busy {
+            return;
+        }
+        let Some((server, token)) = self.admin_credentials() else {
+            return;
+        };
+        let message = format!("Rede \"{name}\" excluída.");
+        self.start_admin_action(
+            move || {
+                shadowvpn_client::delete_network(&server, &token, &name)
+                    .map_err(|error| format!("{error:#}"))
+            },
+            message,
+            true,
+        );
+    }
+
+    fn rotate_admin_password(&mut self) {
+        if self.admin_busy {
+            return;
+        }
+        let password = self.admin_new_password.clone();
+        if password != self.admin_new_password_confirm {
+            self.admin_error = Some("As senhas não coincidem.".into());
+            return;
+        }
+        if !valid_password(&password) {
+            self.admin_error = Some("A senha deve ter entre 8 e 128 caracteres.".into());
+            return;
+        }
+        let Some(name) = self.admin_selected.clone() else {
+            return;
+        };
+        let Some((server, token)) = self.admin_credentials() else {
+            return;
+        };
+        self.admin_new_password.clear();
+        self.admin_new_password_confirm.clear();
+        self.admin_rotate_confirm = false;
+        let message =
+            format!("Senha da rede \"{name}\" alterada; todas as sessões foram encerradas.");
+        self.start_admin_action(
+            move || {
+                shadowvpn_client::rotate_password(&server, &token, &name, &password)
+                    .map_err(|error| format!("{error:#}"))
+            },
+            message,
+            false,
+        );
+    }
+
+    fn revoke_admin_member(&mut self, public_key: String) {
+        if self.admin_busy {
+            return;
+        }
+        let Some(name) = self.admin_selected.clone() else {
+            return;
+        };
+        let Some((server, token)) = self.admin_credentials() else {
+            return;
+        };
+        let message =
+            "Membro revogado; a sessão ativa foi encerrada e novas entradas estão bloqueadas."
+                .to_string();
+        self.start_admin_action(
+            move || {
+                shadowvpn_client::revoke_member(&server, &token, &name, &public_key)
+                    .map_err(|error| format!("{error:#}"))
+            },
+            message,
+            false,
+        );
+    }
+
+    fn restore_admin_member(&mut self, public_key: String) {
+        if self.admin_busy {
+            return;
+        }
+        let Some(name) = self.admin_selected.clone() else {
+            return;
+        };
+        let Some((server, token)) = self.admin_credentials() else {
+            return;
+        };
+        let message = "Revogação removida; o membro pode entrar novamente e receberá um IP livre."
+            .to_string();
+        self.start_admin_action(
+            move || {
+                shadowvpn_client::restore_member(&server, &token, &name, &public_key)
+                    .map_err(|error| format!("{error:#}"))
+            },
+            message,
+            false,
+        );
+    }
+
+    fn poll_admin_result(&mut self) {
+        let received = self
+            .admin_receiver
+            .as_ref()
+            .map(|receiver| match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(AdminTaskResult::Snapshot {
+                    networks: Err("a tarefa de administração terminou sem resposta".into()),
+                    members: None,
+                }),
+            });
+
+        let Some(Some(result)) = received else {
+            return;
+        };
+
+        self.admin_receiver = None;
+        self.admin_busy = false;
+        match result {
+            AdminTaskResult::Snapshot { networks, members } => {
+                match networks {
+                    Ok(networks) => {
+                        self.admin_networks = networks;
+                        self.admin_error = None;
+                        if let Some(selected) = &self.admin_selected {
+                            if !self
+                                .admin_networks
+                                .iter()
+                                .any(|network| &network.name == selected)
+                            {
+                                self.admin_selected = None;
+                                self.admin_members.clear();
+                            }
+                        }
+                    }
+                    Err(error) => self.admin_error = Some(error),
+                }
+                if let Some((name, result)) = members {
+                    if self.admin_selected.as_deref() == Some(name.as_str()) {
+                        match result {
+                            Ok(members) => self.admin_members = members,
+                            Err(error) => {
+                                self.admin_members.clear();
+                                if self.admin_error.is_none() {
+                                    self.admin_error = Some(error);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            AdminTaskResult::Action {
+                result,
+                message,
+                deleted,
+            } => match result {
+                Ok(()) => {
+                    self.admin_error = None;
+                    self.admin_notice = Some(message);
+                    self.admin_delete_confirm = None;
+                    self.admin_revoke_confirm = None;
+                    if deleted {
+                        self.admin_selected = None;
+                        self.admin_members.clear();
+                    }
+                    self.refresh_admin();
+                }
+                Err(error) => self.admin_error = Some(error),
+            },
+        }
+    }
+
+    fn admin_window(&mut self, ctx: &egui::Context) {
+        if !self.show_admin {
+            return;
+        }
+
+        let mut open = self.show_admin;
+        let mut refresh_requested = false;
+        let mut select_requested = None;
+        let mut delete_requested = None;
+        let mut rotate_requested = false;
+        let mut revoke_requested = None;
+        let mut restore_requested = None;
+        let mut copied_key = None;
+        let busy = self.admin_busy;
+
+        egui::Window::new("Administração do servidor")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(760.0)
+            .min_width(600.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(
+                        "Gerencie redes e membros sem usar a CLI. O token fica apenas na memória \
+                         da GUI.",
+                    )
+                    .size(11.5)
+                    .color(MUTED),
+                );
+                ui.add_space(8.0);
+                field_label(ui, "SERVIDOR");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.admin_server)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("https://vpn.exemplo.com"),
+                );
+                ui.add_space(6.0);
+                field_label(ui, "TOKEN DE ADMINISTRAÇÃO");
+                ui.horizontal(|ui| {
+                    let width = (ui.available_width() - 150.0).max(220.0);
+                    ui.add_sized(
+                        [width, 30.0],
+                        egui::TextEdit::singleline(&mut self.admin_token)
+                            .password(!self.show_admin_token)
+                            .hint_text("Bearer token"),
+                    );
+                    ui.checkbox(&mut self.show_admin_token, "Mostrar");
+                    if ui
+                        .add_enabled(
+                            !busy,
+                            egui::Button::new(RichText::new("Atualizar").size(11.5).color(TEXT))
+                                .fill(ACCENT_DARK)
+                                .stroke(Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.5)))
+                                .rounding(Rounding::same(7.0)),
+                        )
+                        .clicked()
+                    {
+                        refresh_requested = true;
+                    }
+                });
+                if self.resolved_admin_token(&self.admin_server).is_some() {
+                    ui.add_space(3.0);
+                    ui.label(
+                        RichText::new(
+                            "O token local é carregado automaticamente quando o servidor é loopback.",
+                        )
+                        .size(9.5)
+                        .color(MUTED),
+                    );
+                }
+
+                if self.admin_busy {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(16.0).color(ACCENT));
+                        ui.label(RichText::new("Consultando o servidor...").size(11.0).color(MUTED));
+                    });
+                }
+                if let Some(error) = &self.admin_error {
+                    ui.add_space(8.0);
+                    banner(ui, error, DANGER);
+                }
+                if let Some(notice) = &self.admin_notice {
+                    ui.add_space(8.0);
+                    banner(ui, notice, ACCENT);
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    eyebrow(ui, "REDES");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!("{} rede(s)", self.admin_networks.len()))
+                                .size(10.0)
+                                .color(MUTED),
+                        );
+                    });
+                });
+                ui.add_space(6.0);
+
+                egui::ScrollArea::vertical()
+                    .max_height(430.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if self.admin_networks.is_empty() {
+                            Frame::none()
+                                .fill(CARD)
+                                .stroke(Stroke::new(1.0_f32, BORDER))
+                                .rounding(Rounding::same(10.0))
+                                .inner_margin(Margin::same(14.0))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.label(
+                                        RichText::new("Nenhuma rede carregada")
+                                            .size(13.0)
+                                            .strong()
+                                            .color(TEXT),
+                                    );
+                                    ui.label(
+                                        RichText::new(
+                                            "Informe o servidor e o token e clique em Atualizar.",
+                                        )
+                                        .size(10.5)
+                                        .color(MUTED),
+                                    );
+                                });
+                        } else {
+                            let networks = self.admin_networks.clone();
+                            let selected = self.admin_selected.clone();
+                            for network in &networks {
+                                let is_selected =
+                                    selected.as_deref() == Some(network.name.as_str());
+                                Frame::none()
+                                    .fill(if is_selected { CARD_ALT } else { CARD })
+                                    .stroke(Stroke::new(
+                                        1.0_f32,
+                                        if is_selected {
+                                            ACCENT.gamma_multiply(0.35)
+                                        } else {
+                                            BORDER
+                                        },
+                                    ))
+                                    .rounding(Rounding::same(10.0))
+                                    .inner_margin(Margin::same(12.0))
+                                    .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        ui.horizontal(|ui| {
+                                            ui.vertical(|ui| {
+                                                ui.add(
+                                                    Label::new(
+                                                        RichText::new(&network.name)
+                                                            .size(14.0)
+                                                            .strong()
+                                                            .color(TEXT),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        "{} online • {} conhecidos • {} revogados",
+                                                        network.online_peers,
+                                                        network.known_peers,
+                                                        network.blocked_peers
+                                                    ))
+                                                    .size(10.0)
+                                                    .color(MUTED),
+                                                );
+                                            });
+                                            ui.with_layout(
+                                                Layout::right_to_left(Align::Center),
+                                                |ui| {
+                                                    let label = if is_selected {
+                                                        "Selecionada"
+                                                    } else {
+                                                        "Gerenciar"
+                                                    };
+                                                    if ui
+                                                        .add_enabled(
+                                                            !busy && !is_selected,
+                                                            egui::Button::new(
+                                                                RichText::new(label)
+                                                                    .size(10.5)
+                                                                    .color(if is_selected {
+                                                                        ACCENT
+                                                                    } else {
+                                                                        TEXT
+                                                                    }),
+                                                            )
+                                                            .fill(if is_selected {
+                                                                Color32::TRANSPARENT
+                                                            } else {
+                                                                ACCENT_DARK
+                                                            })
+                                                            .stroke(Stroke::new(
+                                                                1.0_f32,
+                                                                ACCENT.gamma_multiply(0.45),
+                                                            ))
+                                                            .rounding(Rounding::same(7.0)),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        select_requested =
+                                                            Some(network.name.clone());
+                                                    }
+                                                },
+                                            );
+                                        });
+                                    });
+                                ui.add_space(8.0);
+                            }
+                        }
+
+                        if let Some(selected) = self.admin_selected.clone() {
+                            ui.add_space(4.0);
+                            ui.separator();
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                eyebrow(ui, "MEMBROS DA REDE");
+                                ui.label(
+                                    RichText::new(&selected)
+                                        .size(12.0)
+                                        .strong()
+                                        .color(ACCENT),
+                                );
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if ui
+                                        .add_enabled(
+                                            !busy,
+                                            egui::Button::new(
+                                                RichText::new("Recarregar membros")
+                                                    .size(10.0)
+                                                    .color(TEXT),
+                                            )
+                                            .fill(CARD)
+                                            .stroke(Stroke::new(1.0_f32, BORDER))
+                                            .rounding(Rounding::same(7.0)),
+                                        )
+                                        .clicked()
+                                    {
+                                        refresh_requested = true;
+                                    }
+                                });
+                            });
+                            ui.add_space(6.0);
+
+                            if self.admin_members.is_empty() {
+                                ui.label(
+                                    RichText::new("Nenhum membro registrado ou carregado.")
+                                        .size(10.5)
+                                        .color(MUTED),
+                                );
+                            } else {
+                                let members = self.admin_members.clone();
+                                for member in &members {
+                                    let confirm_revoke = self
+                                        .admin_revoke_confirm
+                                        .as_deref()
+                                        .map(|key| key == member.public_key)
+                                        .unwrap_or(false);
+                                    let (status, color) = if member.blocked {
+                                        ("REVOGADO", DANGER)
+                                    } else if member.online {
+                                        ("ONLINE", GREEN)
+                                    } else {
+                                        ("OFFLINE", MUTED)
+                                    };
+                                    let key = member.public_key.clone();
+                                    Frame::none()
+                                        .fill(CARD)
+                                        .stroke(Stroke::new(1.0_f32, BORDER))
+                                        .rounding(Rounding::same(9.0))
+                                        .inner_margin(Margin::same(10.0))
+                                        .show(ui, |ui| {
+                                            ui.set_width(ui.available_width());
+                                            ui.horizontal(|ui| {
+                                                ui.vertical(|ui| {
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(
+                                                            RichText::new(status)
+                                                                .size(9.0)
+                                                                .strong()
+                                                                .color(color),
+                                                        );
+                                                        ui.label(
+                                                            RichText::new(
+                                                                member
+                                                                    .hostname
+                                                                    .as_deref()
+                                                                    .unwrap_or("sem hostname"),
+                                                            )
+                                                            .size(12.0)
+                                                            .strong()
+                                                            .color(TEXT),
+                                                        );
+                                                    });
+                                                    ui.label(
+                                                        RichText::new(format!(
+                                                            "{} • {}",
+                                                            member
+                                                                .virtual_ip
+                                                                .as_deref()
+                                                                .unwrap_or("sem IP"),
+                                                            member.fingerprint
+                                                        ))
+                                                        .monospace()
+                                                        .size(9.5)
+                                                        .color(MUTED),
+                                                    );
+                                                });
+                                                ui.with_layout(
+                                                    Layout::right_to_left(Align::Center),
+                                                    |ui| {
+                                                        if member.blocked {
+                                                            if ui
+                                                                .add_enabled(
+                                                                    !busy,
+                                                                    egui::Button::new(
+                                                                        RichText::new("Liberar")
+                                                                            .size(10.0)
+                                                                            .color(ACCENT),
+                                                                    )
+                                                                    .fill(CARD_ALT)
+                                                                    .stroke(Stroke::new(
+                                                                        1.0_f32,
+                                                                        ACCENT.gamma_multiply(
+                                                                            0.4,
+                                                                        ),
+                                                                    ))
+                                                                    .rounding(Rounding::same(7.0)),
+                                                                )
+                                                                .clicked()
+                                                            {
+                                                                restore_requested =
+                                                                    Some(key.clone());
+                                                            }
+                                                        } else if confirm_revoke {
+                                                            if ui
+                                                                .add_enabled(
+                                                                    !busy,
+                                                                    egui::Button::new(
+                                                                        RichText::new(
+                                                                            "Confirmar revogação",
+                                                                        )
+                                                                        .size(10.0)
+                                                                        .color(
+                                                                            Color32::from_rgb(
+                                                                                255, 192, 194,
+                                                                            ),
+                                                                        ),
+                                                                    )
+                                                                    .fill(Color32::from_rgb(
+                                                                        83, 35, 45,
+                                                                    ))
+                                                                    .stroke(Stroke::new(
+                                                                        1.0_f32,
+                                                                        DANGER,
+                                                                    ))
+                                                                    .rounding(Rounding::same(7.0)),
+                                                                )
+                                                                .clicked()
+                                                            {
+                                                                revoke_requested = Some(key.clone());
+                                                            }
+                                                            if ui
+                                                                .add_enabled(
+                                                                    !busy,
+                                                                    egui::Button::new(
+                                                                        RichText::new("Cancelar")
+                                                                            .size(10.0)
+                                                                            .color(MUTED),
+                                                                    )
+                                                                    .frame(false),
+                                                                )
+                                                                .clicked()
+                                                            {
+                                                                self.admin_revoke_confirm = None;
+                                                            }
+                                                        } else if ui
+                                                            .add_enabled(
+                                                                !busy,
+                                                                egui::Button::new(
+                                                                    RichText::new("Revogar")
+                                                                        .size(10.0)
+                                                                        .color(DANGER),
+                                                                )
+                                                                .frame(false),
+                                                            )
+                                                            .on_hover_text(
+                                                                "Encerra a sessão e bloqueia novas \
+                                                                 entradas desta chave até Liberar.",
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            self.admin_revoke_confirm =
+                                                                Some(key.clone());
+                                                        }
+                                                        if ui
+                                                            .add(
+                                                                egui::Button::new(
+                                                                    RichText::new("Copiar chave")
+                                                                        .size(9.5)
+                                                                        .color(MUTED),
+                                                                )
+                                                                .frame(false),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            copied_key = Some(key.clone());
+                                                        }
+                                                    },
+                                                );
+                                            });
+                                        });
+                                    ui.add_space(6.0);
+                                }
+                            }
+
+                            ui.add_space(4.0);
+                            ui.separator();
+                            ui.add_space(6.0);
+                            eyebrow(ui, "ALTERAR SENHA DA REDE");
+                            ui.add_space(5.0);
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [210.0, 30.0],
+                                    egui::TextEdit::singleline(&mut self.admin_new_password)
+                                        .password(true)
+                                        .hint_text("nova senha"),
+                                );
+                                ui.add_sized(
+                                    [210.0, 30.0],
+                                    egui::TextEdit::singleline(
+                                        &mut self.admin_new_password_confirm,
+                                    )
+                                    .password(true)
+                                    .hint_text("confirmar nova senha"),
+                                );
+                                if ui
+                                    .add_enabled(
+                                        !busy,
+                                        egui::Button::new(
+                                            RichText::new("Trocar senha").size(10.5).color(TEXT),
+                                        )
+                                        .fill(CARD_ALT)
+                                        .stroke(Stroke::new(
+                                            1.0_f32,
+                                            AMBER.gamma_multiply(0.5),
+                                        ))
+                                        .rounding(Rounding::same(7.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    rotate_requested = true;
+                                }
+                            });
+                            ui.add_space(4.0);
+                            ui.checkbox(
+                                &mut self.admin_rotate_confirm,
+                                "Confirmo que todos os membros serão desconectados.",
+                            );
+
+                            ui.add_space(8.0);
+                            ui.separator();
+                            ui.add_space(6.0);
+                            if self.admin_delete_confirm.as_deref() == Some(selected.as_str()) {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(
+                                            "Excluir a rede remove membros, IPs e sessões. Confirmar?",
+                                        )
+                                        .size(10.5)
+                                        .color(DANGER),
+                                    );
+                                    if ui
+                                        .add_enabled(
+                                            !busy,
+                                            egui::Button::new(
+                                                RichText::new("Confirmar exclusão")
+                                                    .size(10.0)
+                                                    .color(Color32::from_rgb(255, 192, 194)),
+                                            )
+                                            .fill(Color32::from_rgb(83, 35, 45))
+                                            .stroke(Stroke::new(1.0_f32, DANGER))
+                                            .rounding(Rounding::same(7.0)),
+                                        )
+                                        .clicked()
+                                    {
+                                        delete_requested = Some(selected.clone());
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            !busy,
+                                            egui::Button::new(
+                                                RichText::new("Cancelar").size(10.0).color(MUTED),
+                                            )
+                                            .frame(false),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.admin_delete_confirm = None;
+                                    }
+                                });
+                            } else if ui
+                                .add_enabled(
+                                    !busy,
+                                    egui::Button::new(
+                                        RichText::new("Excluir rede")
+                                            .size(10.0)
+                                            .color(DANGER),
+                                    )
+                                    .frame(false),
+                                )
+                                .clicked()
+                            {
+                                self.admin_delete_confirm = Some(selected.clone());
+                            }
+                        }
+                    });
+            });
+
+        self.show_admin = open;
+        if let Some(key) = copied_key {
+            ctx.copy_text(key);
+            self.admin_notice = Some("Chave pública copiada.".into());
+        }
+        if let Some(name) = select_requested {
+            self.admin_selected = Some(name);
+            self.admin_members.clear();
+            self.admin_delete_confirm = None;
+            self.admin_revoke_confirm = None;
+            self.admin_rotate_confirm = false;
+            self.admin_new_password.clear();
+            self.admin_new_password_confirm.clear();
+            self.refresh_admin();
+        }
+        if refresh_requested {
+            self.refresh_admin();
+        }
+        if rotate_requested {
+            if self.admin_rotate_confirm {
+                self.rotate_admin_password();
+            } else {
+                self.admin_error =
+                    Some("Marque a confirmação antes de trocar a senha da rede.".into());
+            }
+        }
+        if let Some(key) = revoke_requested {
+            self.revoke_admin_member(key);
+        }
+        if let Some(key) = restore_requested {
+            self.restore_admin_member(key);
+        }
+        if let Some(name) = delete_requested {
+            self.delete_admin_network(name);
+        }
     }
 
     fn poll_create_result(&mut self) {
@@ -1865,6 +2743,7 @@ impl ShadowVpnApp {
 
     fn poll_events(&mut self) {
         self.poll_create_result();
+        self.poll_admin_result();
 
         let mut events = Vec::new();
         if let Some(handle) = &self.handle {

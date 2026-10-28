@@ -81,6 +81,25 @@ enum Command {
         #[arg(long, env = "SHADOWVPN_NEW_PASSWORD", hide_env_values = true)]
         new_password: String,
     },
+    /// Lista membros conhecidos, online e revogados de uma rede.
+    ListMembers {
+        /// Nome da rede.
+        name: String,
+    },
+    /// Revoga o acesso de um membro e encerra a sessão ativa dele.
+    RevokeMember {
+        /// Nome da rede.
+        name: String,
+        /// Chave pública WireGuard em base64.
+        public_key: String,
+    },
+    /// Remove a revogação de um membro para permitir que ele entre novamente.
+    RestoreMember {
+        /// Nome da rede.
+        name: String,
+        /// Chave pública WireGuard em base64.
+        public_key: String,
+    },
 }
 
 #[tokio::main]
@@ -186,11 +205,17 @@ async fn run_admin_command(
             if response.networks.is_empty() {
                 println!("Nenhuma rede cadastrada.");
             } else {
-                println!("{:<32} {:>8} {:>8}", "REDE", "ONLINE", "MEMBROS");
+                println!(
+                    "{:<32} {:>8} {:>8} {:>10}",
+                    "REDE", "ONLINE", "MEMBROS", "REVOGADOS"
+                );
                 for network in response.networks {
                     println!(
-                        "{:<32} {:>8} {:>8}",
-                        network.name, network.online_peers, network.known_peers
+                        "{:<32} {:>8} {:>8} {:>10}",
+                        network.name,
+                        network.online_peers,
+                        network.known_peers,
+                        network.blocked_peers
                     );
                 }
             }
@@ -202,6 +227,42 @@ async fn run_admin_command(
         Command::RotatePassword { name, new_password } => {
             api.rotate_password(&name, &new_password).await?;
             println!("Senha da rede \"{name}\" alterada; sessões encerradas.");
+        }
+        Command::ListMembers { name } => {
+            let response = api.list_members(&name).await?;
+            if response.members.is_empty() {
+                println!("Nenhum membro registrado na rede \"{name}\".");
+            } else {
+                for member in response.members {
+                    let status = if member.blocked {
+                        "revogado"
+                    } else if member.online {
+                        "online"
+                    } else {
+                        "offline"
+                    };
+                    println!(
+                        "{:<8} {:<15} {:<24} {}",
+                        status,
+                        member.virtual_ip.as_deref().unwrap_or("—"),
+                        member.hostname.as_deref().unwrap_or("—"),
+                        member.fingerprint
+                    );
+                    println!("  chave: {}", member.public_key);
+                }
+            }
+        }
+        Command::RevokeMember { name, public_key } => {
+            api.revoke_member(&name, &public_key).await?;
+            println!(
+                "Membro revogado da rede \"{name}\"; a sessão ativa foi encerrada e novas entradas foram bloqueadas."
+            );
+        }
+        Command::RestoreMember { name, public_key } => {
+            api.restore_member(&name, &public_key).await?;
+            println!(
+                "Revogação removida na rede \"{name}\"; o membro pode entrar novamente e receberá um IP livre."
+            );
         }
     }
 

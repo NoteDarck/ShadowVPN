@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -13,12 +13,12 @@ use argon2::{
 use rand_core::{OsRng as SessionOsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use shadowvpn_core::{
-    clean_hostname, valid_group_name, NetworkSummary, PeerIdentity, PeerInfo,
+    clean_hostname, valid_group_name, NetworkMember, NetworkSummary, PeerIdentity, PeerInfo,
     VIRTUAL_NETWORK_PREFIX,
 };
 
-const NETWORKS_FILE_VERSION: u32 = 2;
-const LEGACY_NETWORKS_FILE_VERSION: u32 = 1;
+const NETWORKS_FILE_VERSION: u32 = 3;
+const MIN_NETWORKS_FILE_VERSION: u32 = 1;
 const DEFAULT_MAX_NETWORKS: usize = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +30,8 @@ pub enum StateError {
     GroupFull,
     ServerFull,
     SessionNotFound,
+    MemberNotFound,
+    MemberBlocked,
     Internal,
 }
 
@@ -68,6 +70,8 @@ struct StoredNetwork {
     password_hash: String,
     #[serde(default)]
     members: BTreeMap<String, String>,
+    #[serde(default)]
+    blocked_members: BTreeSet<String>,
 }
 
 #[derive(Clone)]
@@ -77,12 +81,15 @@ struct SessionRef {
     token: String,
 }
 
+#[derive(Clone)]
 struct Group {
     password_hash: String,
     peers: HashMap<String, Peer>,
     members: BTreeMap<String, Ipv4Addr>,
+    blocked_members: BTreeSet<String>,
 }
 
+#[derive(Clone)]
 struct Peer {
     public_key: String,
     identity: PeerIdentity,
@@ -171,6 +178,7 @@ impl AppState {
                 password_hash,
                 peers: HashMap::new(),
                 members: BTreeMap::new(),
+                blocked_members: BTreeSet::new(),
             },
         );
 
@@ -239,6 +247,9 @@ impl AppState {
                 .ok_or(StateError::NetworkNotFound)?;
             if group.password_hash != password_hash {
                 return Err(StateError::InvalidCredentials);
+            }
+            if group.blocked_members.contains(public_key) {
+                return Err(StateError::MemberBlocked);
             }
 
             let existing = group
@@ -491,10 +502,133 @@ impl AppState {
                 name: name.clone(),
                 online_peers: group.peers.len(),
                 known_peers: group.members.len(),
+                blocked_peers: group.blocked_members.len(),
             })
             .collect();
         networks.sort_by(|left, right| left.name.cmp(&right.name));
         networks
+    }
+
+    pub fn list_members(&self, group_name: &str) -> Result<Vec<NetworkMember>, StateError> {
+        let now = Instant::now();
+        let mut inner = self.lock();
+        inner.prune(now, self.peer_ttl);
+        let group = inner
+            .groups
+            .get(group_name)
+            .ok_or(StateError::NetworkNotFound)?;
+
+        let mut members: BTreeMap<String, NetworkMember> = group
+            .members
+            .iter()
+            .map(|(public_key, address)| {
+                let mut member = empty_member(public_key);
+                member.virtual_ip = Some(address.to_string());
+                (public_key.clone(), member)
+            })
+            .collect();
+
+        for peer in group.peers.values() {
+            let member = members
+                .entry(peer.public_key.clone())
+                .or_insert_with(|| empty_member(&peer.public_key));
+            member.fingerprint = peer.fingerprint.clone();
+            member.virtual_ip = Some(peer.virtual_ip.to_string());
+            member.hostname = Some(peer.hostname.clone());
+            member.online = true;
+        }
+
+        for public_key in &group.blocked_members {
+            let member = members
+                .entry(public_key.clone())
+                .or_insert_with(|| empty_member(public_key));
+            member.virtual_ip = None;
+            member.hostname = None;
+            member.online = false;
+            member.blocked = true;
+        }
+
+        let mut members: Vec<NetworkMember> = members.into_values().collect();
+        members.sort_by(|left, right| {
+            left.blocked
+                .cmp(&right.blocked)
+                .then_with(|| right.online.cmp(&left.online))
+                .then_with(|| left.hostname.cmp(&right.hostname))
+                .then_with(|| left.public_key.cmp(&right.public_key))
+        });
+        Ok(members)
+    }
+
+    pub fn revoke_member(&self, group_name: &str, public_key: &str) -> Result<(), StateError> {
+        let mut inner = self.lock();
+        inner.prune(Instant::now(), self.peer_ttl);
+        let ServerInner { groups, sessions } = &mut *inner;
+        let group = groups
+            .get_mut(group_name)
+            .ok_or(StateError::NetworkNotFound)?;
+
+        if !group.members.contains_key(public_key) {
+            if group.blocked_members.contains(public_key) {
+                return Ok(());
+            }
+            return Err(StateError::MemberNotFound);
+        }
+
+        let previous = group.clone();
+        group.members.remove(public_key);
+        group.peers.remove(public_key);
+        group.blocked_members.insert(public_key.to_owned());
+        let session_ids: Vec<u64> = sessions
+            .iter()
+            .filter(|(_, session)| session.group == group_name && session.public_key == public_key)
+            .map(|(session_id, _)| *session_id)
+            .collect();
+
+        if let Some(path) = &self.networks_file {
+            if let Err(error) = save_networks(path, &*groups) {
+                groups.insert(group_name.to_owned(), previous);
+                tracing::error!(
+                    %group_name,
+                    path = %path.display(),
+                    error = %error,
+                    "não foi possível persistir a revogação do membro"
+                );
+                return Err(StateError::Internal);
+            }
+        }
+
+        sessions.retain(|session_id, _| !session_ids.contains(session_id));
+        tracing::info!(%group_name, %public_key, "membro revogado");
+        Ok(())
+    }
+
+    pub fn restore_member(&self, group_name: &str, public_key: &str) -> Result<(), StateError> {
+        let mut inner = self.lock();
+        let group = inner
+            .groups
+            .get_mut(group_name)
+            .ok_or(StateError::NetworkNotFound)?;
+        if !group.blocked_members.remove(public_key) {
+            return Err(StateError::MemberNotFound);
+        }
+
+        if let Some(path) = &self.networks_file {
+            if let Err(error) = save_networks(path, &inner.groups) {
+                if let Some(group) = inner.groups.get_mut(group_name) {
+                    group.blocked_members.insert(public_key.to_owned());
+                }
+                tracing::error!(
+                    %group_name,
+                    path = %path.display(),
+                    error = %error,
+                    "não foi possível persistir a liberação do membro"
+                );
+                return Err(StateError::Internal);
+            }
+        }
+
+        tracing::info!(%group_name, %public_key, "membro liberado");
+        Ok(())
     }
 
     pub fn delete_network(&self, group_name: &str) -> Result<(), StateError> {
@@ -734,6 +868,19 @@ fn display_hostname(value: &str) -> String {
     }
 }
 
+fn empty_member(public_key: &str) -> NetworkMember {
+    NetworkMember {
+        public_key: public_key.to_owned(),
+        fingerprint: shadowvpn_crypto::decode_public_key(public_key)
+            .map(|key| shadowvpn_crypto::peer_fingerprint(&key))
+            .unwrap_or_default(),
+        virtual_ip: None,
+        hostname: None,
+        online: false,
+        blocked: false,
+    }
+}
+
 fn hash_password(password: &str) -> Option<String> {
     let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
@@ -783,7 +930,7 @@ fn load_networks(path: &Path) -> Result<HashMap<String, Group>> {
 
     let stored: NetworksFile = serde_json::from_str(&contents)
         .with_context(|| format!("arquivo de redes inválido: {}", path.display()))?;
-    if stored.version != NETWORKS_FILE_VERSION && stored.version != LEGACY_NETWORKS_FILE_VERSION {
+    if !(MIN_NETWORKS_FILE_VERSION..=NETWORKS_FILE_VERSION).contains(&stored.version) {
         bail!(
             "versão do arquivo de redes não suportada: {}",
             stored.version
@@ -820,12 +967,24 @@ fn load_networks(path: &Path) -> Result<HashMap<String, Group>> {
             members.insert(public_key, address);
         }
 
+        let mut blocked_members = BTreeSet::new();
+        for public_key in network.blocked_members {
+            if !shadowvpn_core::valid_public_key(&public_key) {
+                bail!("chave pública inválida nos membros revogados da rede {name:?}");
+            }
+            if members.contains_key(&public_key) {
+                bail!("membro revogado ainda está ativo na rede {name:?}");
+            }
+            blocked_members.insert(public_key);
+        }
+
         groups.insert(
             name,
             Group {
                 password_hash: network.password_hash,
                 peers: HashMap::new(),
                 members,
+                blocked_members,
             },
         );
     }
@@ -846,6 +1005,7 @@ fn save_networks(path: &Path, groups: &HashMap<String, Group>) -> Result<()> {
                         .iter()
                         .map(|(public_key, address)| (public_key.clone(), address.to_string()))
                         .collect(),
+                    blocked_members: group.blocked_members.clone(),
                 },
             )
         })
@@ -1043,6 +1203,108 @@ mod tests {
             .heartbeat_with_token("grupo", &first.session_token, first.session_id)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn lists_and_revokes_members() {
+        let state = state();
+        let first = register(&state, "grupo", "senha-segura", 1, "pc-1").unwrap();
+        register(&state, "grupo", "senha-segura", 2, "pc-2").unwrap();
+
+        let members = state.list_members("grupo").unwrap();
+        assert_eq!(members.len(), 2);
+        assert!(members
+            .iter()
+            .all(|member| member.online && !member.blocked));
+        let first_member = members
+            .iter()
+            .find(|member| member.public_key == key(1))
+            .expect("primeiro membro");
+        assert_eq!(first_member.virtual_ip.as_deref(), Some("26.26.26.2"));
+        assert_eq!(first_member.hostname.as_deref(), Some("pc-1"));
+        assert!(!first_member.fingerprint.is_empty());
+
+        state.revoke_member("grupo", &key(1)).unwrap();
+        let members = state.list_members("grupo").unwrap();
+        let revoked = members
+            .iter()
+            .find(|member| member.public_key == key(1))
+            .expect("membro revogado");
+        assert!(revoked.blocked && !revoked.online);
+        assert!(revoked.virtual_ip.is_none());
+        assert!(matches!(
+            state.heartbeat_with_token("grupo", &first.session_token, first.session_id),
+            Err(StateError::SessionNotFound)
+        ));
+        assert!(matches!(
+            register(&state, "grupo", "senha-segura", 1, "pc-1"),
+            Err(StateError::MemberBlocked)
+        ));
+        assert_eq!(state.list_networks()[0].blocked_peers, 1);
+
+        let replacement = register(&state, "grupo", "senha-segura", 3, "pc-3").unwrap();
+        assert_eq!(replacement.virtual_ip, Ipv4Addr::new(26, 26, 26, 2));
+
+        state.restore_member("grupo", &key(1)).unwrap();
+        let restored = register(&state, "grupo", "senha-segura", 1, "pc-1").unwrap();
+        assert_eq!(restored.virtual_ip, Ipv4Addr::new(26, 26, 26, 4));
+        assert_eq!(state.list_networks()[0].blocked_peers, 0);
+    }
+
+    #[test]
+    fn persists_revoked_members_across_restart() {
+        let directory = tempfile::tempdir().expect("diretório temporário");
+        let path = directory.path().join("networks.json");
+        let state = AppState::with_networks_file(Duration::from_secs(75), 8081, None, path.clone())
+            .expect("estado persistente");
+        state
+            .create_network("rede-revogada", "senha-segura")
+            .expect("criar rede");
+        register(&state, "rede-revogada", "senha-segura", 1, "pc-1").unwrap();
+        state.revoke_member("rede-revogada", &key(1)).unwrap();
+
+        let contents = fs::read_to_string(&path).expect("arquivo de redes");
+        assert!(contents.contains("\"version\": 3"));
+        assert!(contents.contains("blocked_members"));
+
+        drop(state);
+        let reloaded = AppState::with_networks_file(Duration::from_secs(75), 8081, None, path)
+            .expect("recarregar estado");
+        let members = reloaded.list_members("rede-revogada").unwrap();
+        assert!(members[0].blocked);
+        assert!(matches!(
+            register(&reloaded, "rede-revogada", "senha-segura", 1, "pc-1"),
+            Err(StateError::MemberBlocked)
+        ));
+        reloaded
+            .restore_member("rede-revogada", &key(1))
+            .expect("liberar membro");
+        assert!(register(&reloaded, "rede-revogada", "senha-segura", 1, "pc-1").is_ok());
+    }
+
+    #[test]
+    fn loads_v2_network_file_without_revocations() {
+        let directory = tempfile::tempdir().expect("diretório temporário");
+        let path = directory.path().join("networks.json");
+        let hash = hash_password("senha-segura").unwrap();
+        let contents = serde_json::json!({
+            "version": 2,
+            "networks": {
+                "v2": {
+                    "password_hash": hash,
+                    "members": { key(1): "26.26.26.2" }
+                }
+            }
+        });
+        fs::write(&path, serde_json::to_vec(&contents).unwrap()).unwrap();
+
+        let state = AppState::with_networks_file(Duration::from_secs(75), 8081, None, path)
+            .expect("arquivo v2");
+        let members = state.list_members("v2").unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].virtual_ip.as_deref(), Some("26.26.26.2"));
+        assert!(!members[0].blocked);
+        assert_eq!(state.list_networks()[0].blocked_peers, 0);
     }
 
     #[test]

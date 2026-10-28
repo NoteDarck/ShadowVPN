@@ -136,11 +136,36 @@ pub struct NetworkSummary {
     pub name: String,
     pub online_peers: usize,
     pub known_peers: usize,
+    #[serde(default)]
+    pub blocked_peers: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkListResponse {
     pub networks: Vec<NetworkSummary>,
+}
+
+/// Membro conhecido ou revogado de uma rede.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkMember {
+    pub public_key: String,
+    pub fingerprint: String,
+    #[serde(default)]
+    pub virtual_ip: Option<String>,
+    #[serde(default)]
+    pub hostname: Option<String>,
+    pub online: bool,
+    pub blocked: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemberListResponse {
+    pub members: Vec<NetworkMember>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct MemberKeyRequest {
+    pub public_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
